@@ -1,0 +1,8 @@
+{
+  "name": "ECLIPSE HOLLOW",
+  "description": "Single-file co-op VR horror game with hand-momentum locomotion and procedural creatures.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
