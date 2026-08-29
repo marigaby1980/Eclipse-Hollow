@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -69,6 +70,8 @@
     <b>Objective:</b> carry FUSES out of the field, feed the generator in the shelter, then run the north tunnel.
     Powering it kills every light for three seconds and wakes everything at once.<br>
     <b>Lobby:</b> a terminal stands in the shelter. Type a room code on its keys with your hands, then HOST or JOIN.<br>
+    <b>The WATCHER</b> only moves while nothing is looking at it, and it never runs. If its ring closes
+    around your feet, look straight at it or you are gone.<br>
     <b>If you bleed out</b> you come back as one of them, and you hunt the people you came in with.
   </div>
   <div class="row">
@@ -102,6 +105,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
      4  collision world (AABB soup + spatial hash)
      5  renderer / sky / global lighting controller
      6  textures + materials (world and creature)
+    6b  creature shader layer (veins, wet spec, hostile rim, iris, furnace)
      7  level construction
      8  navigation graph + A*
      9  local player (hand-momentum locomotion, desktop fallback)
@@ -151,6 +155,15 @@ const CFG = {
   MON_HEAR: 9.0,
   MON_SIGHT: 32.0,
 
+  /* The Watcher is not a chaser. It advances in short blink-steps only while
+     unobserved (~1.7 m/s effective), then stops dead inside its attack radius
+     and needs WATCHER_WINDUP seconds of privacy to take you. Eye contact
+     unwinds that grab twice as fast as simply backing out of reach. */
+  WATCHER_STEP: 2.6,
+  WATCHER_CD: 1.5,
+  WATCHER_ATTACK: 3.0,
+  WATCHER_WINDUP: 1.6,
+
   // round
   FUSE_BASE: 3,
   FUSE_MAX: 6,
@@ -186,7 +199,7 @@ const LOOK = {
   lampBoost: 1.85, blackoutFloor: 0.15
 };
 /* Monster geometry density. Lower these first if a headset drops frames. */
-const MQ = { seg: 7, ribs: 7, teeth: 12, fingers: 4, strips: 9, tendrils: 7, eyeLOD: 26 };
+const MQ = { seg: 8, ribs: 9, teeth: 14, fingers: 5, strips: 11, tendrils: 9, eyeLOD: 30 };
 
 /* ──────────────────────────── 2. UTILITIES ─────────────────────────── */
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -790,7 +803,9 @@ function buildTextures() {
 }
 
 /* Creature skins are separate because they carry the detail budget: mottled
-   subdermal veining, pore stipple, bruising, cracked bone, sodden cloth. */
+   subdermal veining, pore stipple, bruising, cracked bone, sodden cloth.
+   The shader layer in 6b adds the parts a canvas cannot fake — view-dependent
+   wetness, ridged capillaries that follow the surface, and a hostile rim. */
 function buildMonsterTextures() {
   TEX.flesh = canvasTex(256, 256, (g, w, h) => {
     g.fillStyle = '#c3b2a6'; g.fillRect(0, 0, w, h);
@@ -841,20 +856,6 @@ function buildMonsterTextures() {
     for (let i = 0; i < 128; i++) { g.lineWidth = 1; g.beginPath(); g.moveTo(i * 2, 0); g.lineTo(i * 2, h); g.stroke(); g.beginPath(); g.moveTo(0, i * 2); g.lineTo(w, i * 2); g.stroke(); }
     for (let i = 0; i < 120; i++) { g.fillStyle = `rgba(${40 + Math.random() * 40 | 0},${42 + Math.random() * 40 | 0},${44 + Math.random() * 40 | 0},.5)`; g.beginPath(); g.ellipse(Math.random() * w, Math.random() * h, 5 + Math.random() * 34, 3 + Math.random() * 20, Math.random() * 3, 0, 7); g.fill(); }
   }, { repeat: 3 });
-  TEX.iris = canvasTex(128, 128, (g, w, h) => {
-    const cx = w / 2, cy = h / 2;
-    g.fillStyle = '#f2e6d8'; g.fillRect(0, 0, w, h);
-    for (let i = 0; i < 220; i++) {
-      const a = Math.random() * 7;
-      g.strokeStyle = `rgba(${170 + Math.random() * 80 | 0},${40 + Math.random() * 50 | 0},${18 + Math.random() * 30 | 0},.7)`;
-      g.lineWidth = 0.8 + Math.random() * 1.6;
-      g.beginPath();
-      g.moveTo(cx + Math.cos(a) * 14, cy + Math.sin(a) * 14);
-      g.lineTo(cx + Math.cos(a) * (28 + Math.random() * 18), cy + Math.sin(a) * (28 + Math.random() * 18));
-      g.stroke();
-    }
-    g.fillStyle = '#080403'; g.beginPath(); g.arc(cx, cy, 15, 0, 7); g.fill();
-  });
 }
 
 const MATS = {};
@@ -883,28 +884,240 @@ function buildMaterials() {
   MATS.bulbOff   = new THREE.MeshBasicMaterial({ color: 0x8e8b84 });
 }
 
+/* ══════════ 6b. CREATURE SHADER LAYER ═══════════════════════════════
+   Phong is kept and *extended* rather than replaced, so hemi/ambient/sun/fill
+   and all ten pooled lamps still light the creatures exactly as before.
+   Three additions per pixel:
+     · ridged 3-octave noise for capillaries and mottling, in object space so
+       it does not swim as limbs animate
+     · noise-modulated specularStrength — the difference between wet meat and
+       painted plastic under a bright sky
+     · a fresnel rim added to totalEmissiveRadiance that warms as the pack goes
+       hostile, driven by one shared uHeat
+   Every string replacement is verified; if a three.js chunk name ever moves,
+   the material silently falls back to plain Phong instead of failing to compile.
+   ═══════════════════════════════════════════════════════════════════ */
+const SHADED = [], SHADER_TICK = [];
+let SHADER_HEAT = 0;
+
+const GL_NOISE = `
+float ehHash(vec3 p){ return fract(sin(dot(p,vec3(12.9898,78.233,37.719)))*43758.5453123); }
+float ehNoise(vec3 p){
+  vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+  float a=mix(mix(ehHash(i),ehHash(i+vec3(1.0,0.0,0.0)),f.x),
+              mix(ehHash(i+vec3(0.0,1.0,0.0)),ehHash(i+vec3(1.0,1.0,0.0)),f.x),f.y);
+  float b=mix(mix(ehHash(i+vec3(0.0,0.0,1.0)),ehHash(i+vec3(1.0,0.0,1.0)),f.x),
+              mix(ehHash(i+vec3(0.0,1.0,1.0)),ehHash(i+vec3(1.0,1.0,1.0)),f.x),f.y);
+  return mix(a,b,f.z);
+}
+float ehFbm(vec3 p){ return ehNoise(p)*0.62+ehNoise(p*2.7)*0.26+ehNoise(p*6.3)*0.12; }
+`;
+
+function enhanceFlesh(mat, opt = {}) {
+  const U = {
+    uTime:      { value: 0 },
+    uHeat:      { value: 0 },
+    uSeed:      { value: opt.seed === undefined ? Math.random() * 40 : opt.seed },
+    uScale:     { value: opt.scale === undefined ? 7.0 : opt.scale },
+    uMottle:    { value: opt.mottle === undefined ? 0.5 : opt.mottle },
+    uVeinAmt:   { value: opt.vein === undefined ? 0.4 : opt.vein },
+    uVeinColor: { value: new THREE.Color(opt.veinColor === undefined ? 0x3d0c10 : opt.veinColor) },
+    uWet:       { value: opt.wet === undefined ? 0.7 : opt.wet },
+    uRimColor:  { value: new THREE.Color(opt.rim === undefined ? 0xff5a34 : opt.rim) },
+    uRimAmt:    { value: opt.rimAmt === undefined ? 0.16 : opt.rimAmt },
+    uRimHot:    { value: opt.rimHot === undefined ? 0.5 : opt.rimHot },
+    uRimPow:    { value: opt.rimPow === undefined ? 2.6 : opt.rimPow },
+    uPulse:     { value: opt.pulse === undefined ? 0.0 : opt.pulse },
+    uPulseRate: { value: opt.pulseRate === undefined ? 2.2 : opt.pulseRate }
+  };
+  mat.userData.U = U;
+  mat.onBeforeCompile = sh => {
+    const v0 = sh.vertexShader, f0 = sh.fragmentShader;
+    try {
+      const vs = v0
+        .replace('#include <common>', '#include <common>\nvarying vec3 vEHPos;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vEHPos = position;');
+      const fs = f0
+        .replace('#include <common>', `#include <common>
+varying vec3 vEHPos;
+uniform float uTime,uHeat,uSeed,uScale,uMottle,uVeinAmt,uWet,uRimAmt,uRimHot,uRimPow,uPulse,uPulseRate;
+uniform vec3 uVeinColor,uRimColor;
+${GL_NOISE}`)
+        .replace('#include <color_fragment>', `#include <color_fragment>
+  vec3 ehP = vEHPos*uScale + uSeed;
+  float ehN = ehFbm(ehP);
+  float ehRidge = pow(clamp(1.0-abs(ehN*2.0-1.0),0.0,1.0), 7.0);
+  diffuseColor.rgb *= 1.0 + (ehN-0.5)*uMottle;
+  diffuseColor.rgb = mix(diffuseColor.rgb, uVeinColor, ehRidge*uVeinAmt);
+  diffuseColor.rgb *= 1.0 - ehFbm(ehP*4.7)*0.16*uMottle;
+  float ehBeat = 0.5+0.5*sin(uTime*uPulseRate + ehN*6.2831);
+  diffuseColor.rgb += uRimColor*(uPulse*ehBeat*(0.25+0.75*ehRidge));`)
+        .replace('#include <specularmap_fragment>', `#include <specularmap_fragment>
+  specularStrength *= 0.35 + 1.7*uWet*ehFbm(vEHPos*uScale*2.3 + uSeed*1.7);`)
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+  float ehFres = pow(clamp(1.0-abs(dot(normalize(normal), normalize(vViewPosition))),0.0,1.0), uRimPow);
+  totalEmissiveRadiance += uRimColor*ehFres*(uRimAmt + uHeat*uRimHot);`);
+      if (vs.indexOf('vEHPos = position') < 0 || fs.indexOf('ehFbm') < 0 ||
+          fs.indexOf('ehRidge') < 0 || fs.indexOf('ehFres') < 0 ||
+          fs.indexOf('specularStrength *= 0.35') < 0) throw new Error('chunk moved');
+      sh.vertexShader = vs; sh.fragmentShader = fs;
+      Object.assign(sh.uniforms, U);
+    } catch (e) { sh.vertexShader = v0; sh.fragmentShader = f0; }
+  };
+  mat.customProgramCacheKey = () => 'eh-flesh-v1';
+  SHADED.push(mat);
+  return mat;
+}
+
+/* procedural iris: radial stromal fibres, dark limbal ring, a wet catchlight,
+   and a bloom that rides uHeat. Replaces the old canvas iris entirely. */
+function irisShader(tint) {
+  const m = new THREE.ShaderMaterial({
+    fog: false,
+    uniforms: { uTime: { value: 0 }, uHeat: { value: 0 }, uTint: { value: new THREE.Color(tint) } },
+    vertexShader: `varying vec3 vP;
+      void main(){ vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    fragmentShader: `
+      varying vec3 vP; uniform float uTime,uHeat; uniform vec3 uTint;
+      float h2(vec2 p){ return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453); }
+      void main(){
+        vec3 d = normalize(vP);
+        float rr = clamp(length(d.xy)/0.97, 0.0, 1.0);
+        float ang = atan(d.y, d.x);
+        float fib  = 0.5+0.5*sin(ang*86.0 + h2(vec2(floor(ang*11.0),3.0))*6.283);
+        float fib2 = 0.5+0.5*sin(ang*29.0 - 1.7);
+        vec3 col = mix(uTint*1.20, uTint*0.32, rr);
+        col *= 0.70 + 0.55*fib*(0.30+rr) + fib2*0.12;
+        float pupil = smoothstep(0.44, 0.31, rr);
+        col = mix(col, vec3(0.012,0.006,0.006), pupil);
+        col = mix(col, vec3(0.03,0.015,0.012), smoothstep(0.70,1.0,rr)*0.92);
+        col += uTint*uHeat*0.55*(1.0-pupil);
+        float spec = pow(clamp(1.0-length(d.xy-vec2(-0.30,0.30)),0.0,1.0), 9.0);
+        col += vec3(1.0)*spec*0.6;
+        gl_FragColor = vec4(col, 1.0);
+      }`
+  });
+  SHADER_TICK.push(m);
+  return m;
+}
+
+/* the Warden's reliquary furnace — turbulent, not a flat orange ball */
+function coreShader() {
+  const m = new THREE.ShaderMaterial({
+    fog: false,
+    uniforms: { uTime: { value: 0 }, uHeat: { value: 0 } },
+    vertexShader: `varying vec3 vP; varying vec3 vN;
+      void main(){ vP=position; vN=normalize(normalMatrix*normal);
+        gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    fragmentShader: `
+      varying vec3 vP; varying vec3 vN; uniform float uTime,uHeat;
+      ${GL_NOISE}
+      void main(){
+        vec3 p = normalize(vP);
+        float n  = ehFbm(p*3.4 + vec3(0.0,-uTime*0.95,uTime*0.35));
+        float n2 = ehFbm(p*7.6 - vec3(uTime*0.55));
+        float hh = clamp(n*1.3 + n2*0.55, 0.0, 1.7);
+        vec3 col = mix(vec3(0.38,0.05,0.01), vec3(1.55,0.60,0.13), hh);
+        col = mix(col, vec3(2.3,1.55,0.72), pow(clamp(hh-0.62,0.0,1.0),1.5));
+        float fres = pow(1.0-abs(dot(vN, vec3(0.0,0.0,1.0))), 2.2);
+        col += vec3(1.0,0.34,0.07)*fres*0.55;
+        col *= 0.85 + uHeat*0.4;
+        gl_FragColor = vec4(col, 1.0);
+      }`
+  });
+  SHADER_TICK.push(m);
+  return m;
+}
+
+/* the Watcher's reach, drawn on the floor. Once this ring closes over your
+   boots it has you in WATCHER_WINDUP seconds unless you look straight at it. */
+function makeZoneRing(radius) {
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uTime: { value: 0 }, uAmt: { value: 0 }, uR: { value: radius },
+      uCol: { value: new THREE.Color(0x9fe8ff) }
+    },
+    vertexShader: `varying vec3 vP;
+      void main(){ vP=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    fragmentShader: `
+      varying vec3 vP; uniform float uTime,uAmt,uR; uniform vec3 uCol;
+      void main(){
+        float r = clamp(length(vP.xy)/uR, 0.0, 1.4);
+        float a = atan(vP.y, vP.x);
+        float edge   = smoothstep(0.80,0.99,r)*smoothstep(1.05,0.98,r);
+        float sweep  = 0.5+0.5*sin(r*17.0 - uTime*2.4);
+        float spokes = 0.5+0.5*sin(a*16.0 + uTime*0.7);
+        float body   = sweep*0.16*smoothstep(1.0,0.15,r)*(0.45+0.55*spokes);
+        gl_FragColor = vec4(uCol, clamp((edge*0.95 + body)*uAmt, 0.0, 1.0));
+      }`
+  });
+  SHADER_TICK.push(mat);
+  const mesh = new THREE.Mesh(new THREE.RingGeometry(radius * 0.18, radius * 1.04, 72, 1), mat);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = 0.06;
+  mesh.renderOrder = 3;
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+function tickShaders(dt) {
+  const t = nowS();
+  let heat = 0;
+  for (const m of MONS) {
+    const d = m.pos.distanceTo(ME.head);
+    if (d > 44) continue;
+    const h = clamp((m.state === 'chase' ? 0.6 : 0) + m.alert * 0.5 + m.roar * 0.5, 0, 1) * (1 - d / 44);
+    if (h > heat) heat = h;
+  }
+  if (ME.role === ROLE.HOLLOW) heat = Math.max(heat, 0.45);
+  SHADER_HEAT = lerp(SHADER_HEAT, heat, 1 - Math.exp(-3 * dt));
+  for (const m of SHADED) {
+    const U = m.userData.U;
+    U.uTime.value = t; U.uHeat.value = SHADER_HEAT;
+  }
+  for (const m of SHADER_TICK) {
+    const u = m.uniforms;
+    if (u.uTime) u.uTime.value = t;
+    if (u.uHeat) u.uHeat.value = SHADER_HEAT;
+  }
+}
+
 /* Phong, not Lambert, and not Standard. The wet specular highlight is what
    makes flesh read as flesh under bright light; Standard costs more for a
-   difference you will not see on a headset. */
+   difference you will not see on a headset. Each material gets its own noise
+   seed and scale so a stalker's hide never tiles against a warden's. */
 function buildMonsterMats() {
   const P = (map, color, shin, spec, flat) => new THREE.MeshPhongMaterial(
     { map, color, shininess: shin, specular: spec, flatShading: !!flat });
-  MATS.flesh   = P(TEX.flesh, 0xd4c4b8, 34, 0x4a4038, true);
-  MATS.fleshP  = P(TEX.flesh, 0xefe2d8, 48, 0x5a5048);
-  MATS.fleshD  = P(TEX.fleshD, 0x9a7466, 20, 0x30281f, true);
-  MATS.bone    = P(TEX.bone, 0xf2ecd8, 16, 0x241f16);
-  MATS.boneWet = P(TEX.bone, 0xfffaea, 64, 0x6a6250);
-  MATS.plateM  = P(TEX.plate, 0xb0b4bc, 30, 0x5a5a66, true);
-  MATS.sinew   = P(null, 0xa8524a, 46, 0x4a3630);
-  MATS.drip    = P(null, 0x6a1a1c, 84, 0x603038);
-  MATS.gum     = P(null, 0x7a2830, 58, 0x50303a);
+  MATS.flesh   = enhanceFlesh(P(TEX.flesh, 0xd4c4b8, 38, 0x4a4038, true),
+    { seed: 3.1, scale: 6.5, mottle: 0.55, vein: 0.42, veinColor: 0x40100f, wet: 0.80, rim: 0xff5a34, rimAmt: 0.15, rimHot: 0.55, pulse: 0.05, pulseRate: 2.0 });
+  MATS.fleshP  = enhanceFlesh(P(TEX.flesh, 0xefe2d8, 52, 0x5a5048),
+    { seed: 11.7, scale: 8.2, mottle: 0.42, vein: 0.34, veinColor: 0x5a1a1c, wet: 0.95, rim: 0xff7a52, rimAmt: 0.19, rimHot: 0.50, pulse: 0.06, pulseRate: 2.4 });
+  MATS.fleshD  = enhanceFlesh(P(TEX.fleshD, 0x9a7466, 22, 0x30281f, true),
+    { seed: 21.3, scale: 5.4, mottle: 0.62, vein: 0.30, veinColor: 0x2a0a0c, wet: 0.55, rim: 0xc23a22, rimAmt: 0.11, rimHot: 0.45 });
+  MATS.bone    = enhanceFlesh(P(TEX.bone, 0xf2ecd8, 18, 0x241f16),
+    { seed: 31.9, scale: 9.6, mottle: 0.34, vein: 0.16, veinColor: 0x6a5c40, wet: 0.38, rim: 0xffd9a8, rimAmt: 0.07, rimHot: 0.22, rimPow: 3.1 });
+  MATS.boneWet = enhanceFlesh(P(TEX.bone, 0xfffaea, 70, 0x6a6250),
+    { seed: 41.2, scale: 10.8, mottle: 0.30, vein: 0.18, veinColor: 0x7a6a4a, wet: 1.05, rim: 0xffb490, rimAmt: 0.10, rimHot: 0.34, rimPow: 2.9 });
+  MATS.plateM  = enhanceFlesh(P(TEX.plate, 0xb0b4bc, 34, 0x5a5a66, true),
+    { seed: 51.6, scale: 7.4, mottle: 0.50, vein: 0.20, veinColor: 0x241a14, wet: 0.90, rim: 0xff8a4a, rimAmt: 0.07, rimHot: 0.30 });
+  MATS.sinew   = enhanceFlesh(P(null, 0xa8524a, 50, 0x4a3630),
+    { seed: 61.4, scale: 14.0, mottle: 0.60, vein: 0.50, veinColor: 0x35080c, wet: 1.05, rim: 0xff4a30, rimAmt: 0.18, rimHot: 0.60, pulse: 0.10, pulseRate: 2.8 });
+  MATS.drip    = enhanceFlesh(P(null, 0x6a1a1c, 88, 0x603038),
+    { seed: 71.8, scale: 12.0, mottle: 0.50, vein: 0.40, veinColor: 0x2a0406, wet: 1.25, rim: 0xff3a2a, rimAmt: 0.26, rimHot: 0.80, pulse: 0.22, pulseRate: 3.1 });
+  MATS.gum     = enhanceFlesh(P(null, 0x7a2830, 62, 0x50303a),
+    { seed: 81.2, scale: 11.0, mottle: 0.55, vein: 0.45, veinColor: 0x30080e, wet: 1.10, rim: 0xff5040, rimAmt: 0.20, rimHot: 0.70, pulse: 0.16, pulseRate: 2.6 });
   MATS.maw     = new THREE.MeshBasicMaterial({ color: 0x180608 });
-  MATS.sclera  = P(null, 0xfaf4ea, 92, 0x8a8478);
-  MATS.iris    = new THREE.MeshBasicMaterial({ map: TEX.iris });
-  MATS.irisC   = new THREE.MeshBasicMaterial({ map: TEX.iris, color: 0x8ac8ff });
+  MATS.sclera  = enhanceFlesh(P(null, 0xfaf4ea, 96, 0x8a8478),
+    { seed: 91.5, scale: 22.0, mottle: 0.30, vein: 0.30, veinColor: 0x8a2a22, wet: 1.40, rim: 0xffd6c2, rimAmt: 0.12, rimHot: 0.30, rimPow: 3.4 });
+  MATS.iris    = irisShader(0xd2582a);
+  MATS.irisC   = irisShader(0x6fc8ff);
   MATS.cloth   = new THREE.MeshLambertMaterial({ map: TEX.cloth, color: 0xcfcbc2, side: THREE.DoubleSide });
-  MATS.chainM  = P(null, 0x9aa0a6, 48, 0x707880);
-  MATS.core    = new THREE.MeshBasicMaterial({ color: 0xff8a3a });
+  MATS.chainM  = enhanceFlesh(P(null, 0x9aa0a6, 52, 0x707880),
+    { seed: 101.3, scale: 16.0, mottle: 0.40, vein: 0.10, veinColor: 0x2a2620, wet: 1.00, rim: 0xbcd0e0, rimAmt: 0.06, rimHot: 0.15 });
+  MATS.core    = coreShader();
   MATS.coreOff = new THREE.MeshBasicMaterial({ color: 0x2a1a16 });
 }
 
@@ -1950,11 +2163,44 @@ function spineKnobs(parent, n, mat, r, step, y0, z) {
   }
   return mergeMesh(parent, mat, parts);
 }
+/* a fan of quills or horns around an axis — shoulders, crowns, carapace edges */
+function spikeBand(parent, mat, n, rad, len, y, tilt, seed, ry = 0) {
+  const parts = [], R = mulberry32(hash32('sb' + seed));
+  for (let i = 0; i < n; i++) {
+    const a = i / n * 6.283 + ry;
+    const L = len * (0.62 + R() * 0.8);
+    parts.push(xform(new THREE.ConeGeometry(L * 0.20, L, 5),
+      V(Math.cos(a) * rad, y, Math.sin(a) * rad),
+      new THREE.Euler(tilt + (R() - 0.5) * 0.3, -a, (R() - 0.5) * 0.25)));
+  }
+  return mergeMesh(parent, mat, parts);
+}
+/* rivet/stud studding for plate — cheap, reads as forged rather than moulded */
+function studs(parent, mat, n, spread, seed) {
+  const parts = [], R = mulberry32(hash32('st' + seed));
+  for (let i = 0; i < n; i++) {
+    const s = 0.014 + R() * 0.016;
+    parts.push(xform(new THREE.SphereGeometry(s, 6, 5),
+      V((R() - 0.5) * spread.x, (R() - 0.5) * spread.y, (R() - 0.5) * spread.z)));
+  }
+  return mergeMesh(parent, mat, parts);
+}
+/* short stiff hairs — leg bristles, carapace fuzz */
+function bristles(parent, mat, n, len, spread, seed) {
+  const parts = [], R = mulberry32(hash32('br' + seed));
+  for (let i = 0; i < n; i++) {
+    const L = len * (0.5 + R());
+    parts.push(xform(new THREE.CylinderGeometry(0.0035, 0.001, L, 3),
+      V((R() - 0.5) * spread.x, (R() - 0.5) * spread.y, (R() - 0.5) * spread.z),
+      new THREE.Euler((R() - 0.5) * 2.4, (R() - 0.5) * 3.0, (R() - 0.5) * 2.4)));
+  }
+  return mergeMesh(parent, mat, parts);
+}
 /* eye with a tracking iris and two blinking lids */
 function makeEye(parent, r, x, y, z, irisMat) {
   const g = J(parent, x, y, z);
-  g.add(new THREE.Mesh(new THREE.SphereGeometry(r, 9, 7), MATS.sclera));
-  const iris = new THREE.Mesh(new THREE.SphereGeometry(r * 0.5, 8, 6), irisMat || MATS.iris);
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), MATS.sclera));
+  const iris = new THREE.Mesh(new THREE.SphereGeometry(r * 0.5, 9, 7), irisMat || MATS.iris);
   iris.position.z = -r * 0.62; g.add(iris);
   const lidT = new THREE.Mesh(new THREE.SphereGeometry(r * 1.06, 10, 6, 0, 6.3, 0, 0.9), MATS.fleshD);
   const lidB = new THREE.Mesh(new THREE.SphereGeometry(r * 1.06, 10, 6, 0, 6.3, 0, 0.9), MATS.fleshD);
@@ -1990,6 +2236,10 @@ function clawHand(parent, mat, boneMat, size, count) {
   const hand = J(parent);
   const palm = new THREE.Mesh(jitter(new THREE.BoxGeometry(size * 1.5, size * 0.55, size * 1.1), size * 0.16, 771), mat);
   palm.position.y = -size * 0.3; hand.add(palm);
+  // knuckle ridge across the back of the hand
+  mergeMesh(hand, boneMat, Array.from({ length: count }, (_, i) =>
+    xform(new THREE.SphereGeometry(size * 0.10, 6, 5),
+      V(((count > 1 ? i / (count - 1) : 0.5) - 0.5) * size * 1.35, -size * 0.42, size * 0.18))));
   const fingers = [];
   for (let i = 0; i < count; i++) {
     const f = (count > 1 ? i / (count - 1) : 0.5) - 0.5;
@@ -1999,9 +2249,12 @@ function clawHand(parent, mat, boneMat, size, count) {
     const j2 = J(j1[0], 0, -size * 1.15, 0);
     const tip = new THREE.Mesh(mg([
       jitter(new THREE.CylinderGeometry(size * 0.10, size * 0.055, size * 1.0, MQ.seg, 1), size * 0.02, 500 + i),
-      xform(new THREE.ConeGeometry(size * 0.06, size * 0.62, 5), V(0, -size * 0.78, 0), new THREE.Euler(Math.PI, 0, 0))
+      xform(new THREE.ConeGeometry(size * 0.06, size * 0.62, 5), V(0, -size * 0.78, 0), new THREE.Euler(Math.PI, 0, 0)),
+      xform(new THREE.SphereGeometry(size * 0.055, 6, 5), V(0, -size * 0.05, size * 0.03))
     ]), mat);
     tip.position.y = -size * 0.5; j2.add(tip);
+    const nail = new THREE.Mesh(new THREE.ConeGeometry(size * 0.055, size * 0.44, 5), boneMat);
+    nail.position.y = -size * 1.16; nail.rotation.x = Math.PI - 0.16; j2.add(nail);
     fingers.push([j1[0], j2]);
   }
   const tr = J(hand, size * 0.8, -size * 0.36, size * 0.1);
@@ -2030,21 +2283,28 @@ const MTYPE = {
   stalker: { name: 'STALKER', patrol: 2.3, hunt: 6.4, lunge: 9.5,  scale: 1.00, sight: 32, hear: 1.0, eyeH: 2.70, reach: 1.65 },
   crawler: { name: 'CRAWLER', patrol: 3.2, hunt: 6.9, lunge: 10.4, scale: 0.90, sight: 20, hear: 1.5, eyeH: 0.70, reach: 1.20 },
   warden:  { name: 'WARDEN',  patrol: 1.6, hunt: 5.4, lunge: 7.6,  scale: 1.05, sight: 38, hear: 0.7, eyeH: 2.90, reach: 2.05 },
-  watcher: { name: 'WATCHER', patrol: 0.0, hunt: 0.0, lunge: 0.0,  scale: 1.00, sight: 44, hear: 0.5, eyeH: 2.30, reach: 1.40 }
+  watcher: { name: 'WATCHER', patrol: 0.0, hunt: 0.0, lunge: 0.0,  scale: 1.00, sight: 44, hear: 0.5, eyeH: 2.30, reach: CFG.WATCHER_ATTACK }
 };
 const MOB = {};
-
 /* ── STALKER ── just under 3 m of stilt-walking famine on hyperextended reverse
    knees, arms long enough that the claws hang past the knees. No face: the skull
    opens into a four-petal mandible bloom with sinew stretched between the petals.
-   Ribcage splayed over a hollow cavity with a wet organ inside. */
+   Ribcage splayed over a hollow cavity with a wet organ inside. Now carries an
+   iliac crest, a clavicle shelf, shoulder and cranial quills, a throat sac that
+   inflates when it screams, neck cords that stretch with the bloom, an inner
+   gullet tooth ring, barbed forearms and a fourth pair of eyes. */
 MOB.stalker = () => {
   const root = new THREE.Group();
   const F = MATS.flesh, D = MATS.fleshD, B = MATS.boneWet;
   const lean = J(root), hips = J(lean, 0, 1.43, 0);
 
-  const pelvis = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.26, 10, 8), 0.05, 11), D);
+  const pelvis = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.26, 11, 9), 0.05, 11), D);
   pelvis.scale.set(1.15, 0.78, 0.85); hips.add(pelvis);
+  mergeMesh(hips, B, [                                   // iliac crest + hip spurs
+    xform(new THREE.TorusGeometry(0.25, 0.026, 5, 11, Math.PI * 1.1), V(0, 0.04, 0.02), new THREE.Euler(1.35, 0, 0)),
+    xform(new THREE.ConeGeometry(0.035, 0.16, 5), V(-0.20, 0.06, 0.14), new THREE.Euler(-1.1, 0, -0.5)),
+    xform(new THREE.ConeGeometry(0.035, 0.16, 5), V(0.20, 0.06, 0.14), new THREE.Euler(-1.1, 0, 0.5))
+  ]);
 
   const spine = []; let node = hips;
   const spineOff = [0.10, 0.18, 0.18];
@@ -2052,53 +2312,86 @@ MOB.stalker = () => {
     const j = J(node, 0, spineOff[i], 0);
     const m = new THREE.Mesh(jitter(new THREE.CylinderGeometry(0.19 - i * 0.014, 0.21 - i * 0.014, 0.24, MQ.seg, 2), 0.04, 21 + i), F);
     m.position.y = 0.10; m.scale.z = 0.78; j.add(m);
+    mergeMesh(j, B, [                                    // transverse process nubs
+      xform(new THREE.SphereGeometry(0.022, 6, 5), V(-0.17, 0.10, 0.06)),
+      xform(new THREE.SphereGeometry(0.022, 6, 5), V(0.17, 0.10, 0.06))
+    ]);
     spine.push(j); node = j;
   }
   const chest = J(node, 0, 0.18, 0);
-  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.225, 0.36, 5, MQ.seg), 0.05, 31), F);
+  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.225, 0.36, 6, MQ.seg), 0.05, 31), F);
   trunk.position.y = 0.12; trunk.scale.set(1.16, 1, 0.76); chest.add(trunk);
-  ribCage(chest, MQ.ribs, B, 0.30, 0.075, 0.34);
-  spineKnobs(chest, 6, B, 0.045, 0.10, 0.38, 0.18);
+  ribCage(chest, MQ.ribs, B, 0.30, 0.070, 0.36);
+  spineKnobs(chest, 7, B, 0.045, 0.095, 0.40, 0.18);
+  mergeMesh(chest, B, [                                  // clavicle shelf + sternum keel
+    xform(new THREE.CylinderGeometry(0.030, 0.022, 0.52, 6), V(0, 0.33, -0.06), new THREE.Euler(0, 0, Math.PI / 2)),
+    xform(new THREE.SphereGeometry(0.045, 7, 6), V(-0.27, 0.31, -0.03)),
+    xform(new THREE.SphereGeometry(0.045, 7, 6), V(0.27, 0.31, -0.03)),
+    xform(new THREE.BoxGeometry(0.055, 0.34, 0.035), V(0, 0.14, -0.16))
+  ]);
+  spikeBand(chest, B, 5, 0.24, 0.20, 0.30, -0.9, 1301, 0.4);   // shoulder quills
   const cavity = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 8), MATS.maw);
   cavity.position.set(0, 0.16, 0.02); cavity.scale.set(1, 1.35, 0.55); chest.add(cavity);
-  const organ = new THREE.Mesh(new THREE.SphereGeometry(0.13, 10, 8), MATS.drip);
+  const organ = new THREE.Mesh(new THREE.SphereGeometry(0.13, 11, 9), MATS.drip);
   organ.position.set(0, 0.16, 0.02); organ.scale.set(0.9, 1.2, 0.6); chest.add(organ);
-  const gutStrands = makeStrands(chest, 6, 0.02, 0.28, 0.20, MATS.sinew);
+  const gutStrands = makeStrands(chest, 7, 0.02, 0.28, 0.20, MATS.sinew);
 
   const neck = J(chest, 0, 0.40, 0);
-  const nk = new THREE.Mesh(jitter(new THREE.CylinderGeometry(0.085, 0.105, 0.24, MQ.seg, 1), 0.02, 41), D);
+  const nk = new THREE.Mesh(jitter(new THREE.CylinderGeometry(0.085, 0.105, 0.24, MQ.seg, 2), 0.02, 41), D);
   nk.position.y = 0.12; neck.add(nk);
+  const throat = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.085, 10, 8), 0.012, 43), MATS.gum);
+  throat.position.set(0, 0.10, -0.075); throat.scale.set(1, 0.9, 0.7); neck.add(throat);
+  const cords = [];
+  for (let i = 0; i < 4; i++) {
+    const c = new THREE.Mesh(new THREE.CylinderGeometry(0.0075, 0.006, 0.22, 4), MATS.sinew);
+    c.position.set(-0.048 + i * 0.032, 0.12, 0.062); neck.add(c); cords.push(c);
+  }
+
   const head = J(neck, 0, 0.26, 0);
-  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.19, 12, 10), 0.026, 51), B);
+  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.19, 13, 11), 0.026, 51), B);
   skull.scale.set(0.86, 1.16, 0.96); head.add(skull);
+  spikeBand(head, B, 7, 0.135, 0.16, 0.09, -0.35, 5101);       // cranial quills
+  mergeMesh(head, D, [                                          // occipital plate
+    xform(jitter(new THREE.SphereGeometry(0.155, 10, 8, 0, 6.3, 0, 1.2), 0.014, 5111), V(0, 0.03, 0.055))
+  ]);
   const petals = [];
   for (let i = 0; i < 4; i++) {
     const p = J(head); p.rotation.z = i * Math.PI / 2; p.userData.base = p.rotation.clone();
     const blade = new THREE.Mesh(mg([
-      jitter(new THREE.ConeGeometry(0.085, 0.44, 6, 1, true), 0.02, 61 + i),
-      xform(teethGeo(6, 0.055, 0.02, Math.PI * 1.2, 1), V(0, -0.17, 0))
+      jitter(new THREE.ConeGeometry(0.085, 0.44, 7, 1, true), 0.02, 61 + i),
+      xform(teethGeo(7, 0.055, 0.02, Math.PI * 1.2, 1), V(0, -0.17, 0)),
+      xform(new THREE.ConeGeometry(0.016, 0.09, 4), V(0.055, 0.05, 0), new THREE.Euler(0, 0, -0.7)),
+      xform(new THREE.ConeGeometry(0.016, 0.09, 4), V(-0.055, 0.05, 0), new THREE.Euler(0, 0, 0.7))
     ]), D);
     blade.rotation.x = -1.35; blade.position.set(0, -0.02, -0.20); p.add(blade);
     petals.push(p);
   }
-  const gullet = new THREE.Mesh(new THREE.SphereGeometry(0.10, 9, 7), MATS.maw);
+  const gullet = new THREE.Mesh(new THREE.SphereGeometry(0.10, 10, 8), MATS.maw);
   gullet.position.z = -0.13; head.add(gullet);
+  teethRing(head, MQ.teeth, 0.075, 0.016, B, Math.PI * 2, 1).position.set(0, 0, -0.10);
   const sinew = [];
-  for (let i = 0; i < 4; i++) {
-    const st = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.006, 0.14, 3), MATS.sinew);
-    st.position.set(-0.05 + i * 0.033, -0.06, -0.13); st.rotation.x = Math.PI / 2 + 0.3;
+  for (let i = 0; i < 5; i++) {
+    const st = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.006, 0.14, 4), MATS.sinew);
+    st.position.set(-0.056 + i * 0.028, -0.06, -0.13); st.rotation.x = Math.PI / 2 + 0.3;
     head.add(st); sinew.push(st);
   }
-  const drool = makeStrands(head, 5, -0.14, 0.12, 0.16, MATS.drip);
+  const drool = makeStrands(head, 6, -0.14, 0.12, 0.16, MATS.drip);
   const eyes = [];
-  for (const s of [-1, 1]) for (let i = 0; i < 3; i++)
-    eyes.push(makeEye(head, 0.026 - i * 0.004, s * (0.10 + i * 0.016), 0.07 - i * 0.05, -0.115 - i * 0.012));
+  for (const s of [-1, 1]) for (let i = 0; i < 4; i++)
+    eyes.push(makeEye(head, 0.027 - i * 0.004, s * (0.10 + i * 0.014), 0.075 - i * 0.042, -0.115 - i * 0.011));
 
   const arms = [];
   for (const s of [-1, 1]) {
     const sh = J(chest, s * 0.30, 0.30, 0);
-    sh.add(new THREE.Mesh(new THREE.SphereGeometry(0.105, 9, 7), B));
+    sh.add(new THREE.Mesh(jitter(new THREE.SphereGeometry(0.105, 10, 8), 0.012, 611 + s), B));
+    spikeBand(sh, B, 4, 0.085, 0.13, 0.02, -0.5, 6201 + s);
     const a = chain(sh, [[0.78, 0.105, 0.075], [0.86, 0.075, 0.052]], F, 700 + s * 13);
+    mergeMesh(a[1], B, Array.from({ length: 4 }, (_, i) =>   // forearm barbs
+      xform(new THREE.ConeGeometry(0.017, 0.13, 4), V(s * 0.055, -0.16 - i * 0.19, 0.02),
+        new THREE.Euler(0.2, 0, s * 1.35))));
+    mergeMesh(a[0], D, [                                     // elbow spur
+      xform(new THREE.ConeGeometry(0.030, 0.15, 5), V(0, -0.74, 0.055), new THREE.Euler(1.9, 0, 0))
+    ]);
     const hand = clawHand(a.tip, F, B, 0.16, MQ.fingers);
     arms.push({ sh, a, hand, s });
   }
@@ -2106,47 +2399,66 @@ MOB.stalker = () => {
   for (const s of [-1, 1]) {
     const hipJ = J(hips, s * 0.16, -0.07, 0);
     const l = chain(hipJ, [[0.72, 0.12, 0.088], [0.80, 0.088, 0.058]], F, 800 + s * 7);
+    mergeMesh(l[0], B, [                                     // knee cap + calcar spur
+      xform(jitter(new THREE.SphereGeometry(0.055, 7, 6), 0.008, 810 + s), V(0, -0.70, -0.045)),
+      xform(new THREE.ConeGeometry(0.026, 0.19, 5), V(0, -0.70, 0.075), new THREE.Euler(1.6, 0, 0))
+    ]);
     const foot = J(l.tip);
     const fm = new THREE.Mesh(mg([
       jitter(new THREE.BoxGeometry(0.15, 0.07, 0.34), 0.02, 900 + s),
       xform(new THREE.ConeGeometry(0.026, 0.15, 5), V(-0.05, -0.02, -0.20), new THREE.Euler(-1.75, 0, 0)),
       xform(new THREE.ConeGeometry(0.026, 0.15, 5), V(0.00, -0.02, -0.22), new THREE.Euler(-1.75, 0, 0)),
-      xform(new THREE.ConeGeometry(0.026, 0.15, 5), V(0.05, -0.02, -0.20), new THREE.Euler(-1.75, 0, 0))
+      xform(new THREE.ConeGeometry(0.026, 0.15, 5), V(0.05, -0.02, -0.20), new THREE.Euler(-1.75, 0, 0)),
+      xform(new THREE.ConeGeometry(0.022, 0.12, 5), V(0, -0.01, 0.15), new THREE.Euler(1.75, 0, 0))
     ]), D);
     fm.position.set(0, -0.03, -0.09); foot.add(fm);
     legs.push({ hipJ, l, foot, s, planted: false });
   }
   const light = new THREE.PointLight(0xff3a18, 0, 8, 2); light.position.y = 0.02; head.add(light);
-  root.userData.rig = { type: 'stalker', lean, hips, spine, chest, cavity, organ, neck, head, petals, gullet, sinew, drool, gutStrands, eyes, arms, legs, light, restHip: 1.43 };
+  root.userData.rig = { type: 'stalker', lean, hips, spine, chest, cavity, organ, neck, throat, cords, head, petals, gullet, sinew, drool, gutStrands, eyes, arms, legs, light, restHip: 1.43 };
   return root;
 };
 
 /* ── CRAWLER ── a torso inverted onto four arachnid legs with the knees folded
    above the body line, its human head hanging upside-down beneath the sternum,
    hair dragging. Blind milky eye clusters on the sides of the skull; radial
-   lamprey mouth over three counter-rotating rings. */
+   lamprey mouth over five counter-rotating rings. Now plated across the
+   abdomen, bristled along every leg, and spurred at each joint. */
 MOB.crawler = () => {
   const root = new THREE.Group();
-  const F = MATS.flesh, D = MATS.fleshD, B = MATS.boneWet;
+  const F = MATS.flesh, D = MATS.fleshD, B = MATS.boneWet, PL = MATS.plateM;
   const lean = J(root), core = J(lean, 0, 0.66, 0);
 
-  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.20, 0.52, 5, MQ.seg), 0.045, 1201), F);
+  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.20, 0.52, 6, MQ.seg), 0.045, 1201), F);
   trunk.rotation.x = Math.PI / 2; trunk.scale.set(1.15, 1, 0.80); core.add(trunk);
   const rg = J(core); rg.rotation.x = -Math.PI / 2; rg.userData.base = rg.rotation.clone();
-  ribCage(rg, 6, B, 0.22, 0.10, 0.26);
+  ribCage(rg, 7, B, 0.22, 0.095, 0.28);
   const kj = J(core); kj.rotation.x = -Math.PI / 2; kj.userData.base = kj.rotation.clone();
-  spineKnobs(kj, 7, B, 0.03, 0.11, 0.32, 0);
-  const abdomen = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.17, 10, 8), 0.03, 1210), D);
+  spineKnobs(kj, 8, B, 0.03, 0.10, 0.34, 0);
+  const abdomen = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.17, 11, 9), 0.03, 1210), D);
   abdomen.position.z = 0.42; abdomen.scale.set(0.95, 0.9, 1.35); core.add(abdomen);
-  const belly = makeStrands(core, 6, -0.16, 0.22, 0.14, MATS.sinew);
+  mergeMesh(core, PL, [                                    // abdominal carapace
+    xform(jitter(new THREE.SphereGeometry(0.175, 11, 8, 0, 6.283, 0, 1.05), 0.012, 1215), V(0, 0.03, 0.40), null, V(0.98, 0.85, 1.30)),
+    xform(new THREE.TorusGeometry(0.145, 0.016, 4, 12), V(0, 0.01, 0.26), new THREE.Euler(1.57, 0, 0), V(1, 1, 0.8)),
+    xform(new THREE.TorusGeometry(0.125, 0.014, 4, 12), V(0, 0.01, 0.52), new THREE.Euler(1.57, 0, 0), V(1, 1, 0.8))
+  ]);
+  studs(core, B, 12, V(0.26, 0.10, 0.55), 1218).position.set(0, 0.06, 0.40);
+  spikeBand(core, B, 6, 0.155, 0.13, 0.0, -1.9, 1220, 0.3).position.z = 0.52;
+  bristles(core, D, 18, 0.10, V(0.34, 0.18, 0.70), 1222);
+  const belly = makeStrands(core, 7, -0.16, 0.22, 0.14, MATS.sinew);
 
   const neck = J(core, 0, -0.05, -0.42);
-  const nk2 = new THREE.Mesh(jitter(new THREE.CylinderGeometry(0.06, 0.075, 0.20, MQ.seg, 1), 0.015, 1251), D);
+  const nk2 = new THREE.Mesh(jitter(new THREE.CylinderGeometry(0.06, 0.075, 0.20, MQ.seg, 2), 0.015, 1251), D);
   nk2.position.y = -0.10; neck.add(nk2);
+  mergeMesh(neck, MATS.sinew, Array.from({ length: 3 }, (_, i) =>
+    xform(new THREE.CylinderGeometry(0.0075, 0.006, 0.19, 4), V(-0.03 + i * 0.03, -0.10, 0.05))));
   const head = J(neck, 0, -0.20, 0);
   head.rotation.z = Math.PI; head.userData.base = head.rotation.clone();
-  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.15, 12, 10), 0.022, 1301), B);
+  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.15, 13, 11), 0.022, 1301), B);
   skull.scale.set(0.92, 1.05, 1.0); head.add(skull);
+  mergeMesh(head, D, [                                     // temporal wraps
+    xform(jitter(new THREE.SphereGeometry(0.128, 9, 7, 0, 6.3, 0, 1.0), 0.01, 1305), V(0, 0.02, 0.05))
+  ]);
   const mand = [];
   for (let i = 0; i < 4; i++) {
     const a = i * Math.PI / 2 + Math.PI / 4;
@@ -2154,33 +2466,49 @@ MOB.crawler = () => {
     j.rotation.z = a; j.userData.base = j.rotation.clone();
     const blade = new THREE.Mesh(mg([
       new THREE.ConeGeometry(0.032, 0.20, 5),
-      xform(teethGeo(4, 0.028, 0.012, Math.PI, 1), V(0, -0.06, 0))
+      xform(teethGeo(5, 0.028, 0.012, Math.PI, 1), V(0, -0.06, 0)),
+      xform(new THREE.ConeGeometry(0.011, 0.06, 4), V(0.024, -0.02, 0), new THREE.Euler(0, 0, -0.8))
     ]), B);
     blade.rotation.x = -Math.PI / 2; blade.position.z = -0.09; j.add(blade);
     mand.push(j);
   }
-  const maw = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 6), MATS.maw);
+  const maw = new THREE.Mesh(new THREE.SphereGeometry(0.07, 9, 7), MATS.maw);
   maw.position.z = -0.10; head.add(maw);
   const rings = [];
-  for (let i = 0; i < 3; i++) {
-    const r = new THREE.Mesh(new THREE.TorusGeometry(0.040 - i * 0.008, 0.009, 3, 9), B);
-    r.position.z = -0.13 - i * 0.03; head.add(r); rings.push(r);
+  for (let i = 0; i < 5; i++) {
+    const r = new THREE.Mesh(mg([
+      new THREE.TorusGeometry(0.042 - i * 0.006, 0.008, 3, 10),
+      ...Array.from({ length: 7 }, (_, k) => xform(new THREE.ConeGeometry(0.006, 0.022, 4),
+        V(Math.cos(k / 7 * 6.283) * (0.042 - i * 0.006), Math.sin(k / 7 * 6.283) * (0.042 - i * 0.006), -0.008),
+        new THREE.Euler(-1.57, 0, 0)))
+    ]), B);
+    r.position.z = -0.125 - i * 0.024; head.add(r); rings.push(r);
   }
   const eyes = [];
-  for (const s of [-1, 1]) for (let i = 0; i < 4; i++)
-    eyes.push(makeEye(head, 0.020 - i * 0.002, s * 0.088, 0.03 - i * 0.022, -0.02 + i * 0.03));
+  for (const s of [-1, 1]) for (let i = 0; i < 5; i++)
+    eyes.push(makeEye(head, 0.021 - i * 0.002, s * (0.088 - i * 0.004), 0.035 - i * 0.019, -0.025 + i * 0.026));
   const hairParts = [], HR = mulberry32(4242);
-  for (let i = 0; i < 14; i++)
-    hairParts.push(xform(new THREE.CylinderGeometry(0.005, 0.002, 0.36, 3),
-      V((HR() - 0.5) * 0.2, 0.28, (HR() - 0.5) * 0.14), new THREE.Euler((HR() - 0.5) * 0.5, 0, (HR() - 0.5) * 0.5)));
+  for (let i = 0; i < 22; i++)
+    hairParts.push(xform(new THREE.CylinderGeometry(0.005, 0.002, 0.34 + HR() * 0.12, 3),
+      V((HR() - 0.5) * 0.21, 0.28, (HR() - 0.5) * 0.15), new THREE.Euler((HR() - 0.5) * 0.5, 0, (HR() - 0.5) * 0.5)));
   const hair = new THREE.Mesh(mg(hairParts), D); head.add(hair);
 
   const legs = [];
   [[-1, -0.30], [1, -0.30], [-1, 0.32], [1, 0.32]].forEach(([sx, sz], i) => {
     const hip = J(core, sx * 0.19, 0.02, sz);
     hip.rotation.z = sx * -0.5; hip.userData.base = hip.rotation.clone();
+    mergeMesh(hip, PL, [xform(jitter(new THREE.SphereGeometry(0.062, 8, 6), 0.008, 1450 + i), V(0, -0.01, 0))]);
     const l = chain(hip, [[0.52, 0.055, 0.042], [0.64, 0.042, 0.024]], D, 1500 + i * 57);
-    const cl = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.17, 5), B);
+    mergeMesh(l[0], B, [                                   // femoral spur at the folded knee
+      xform(new THREE.ConeGeometry(0.024, 0.15, 5), V(0, -0.50, -0.035), new THREE.Euler(-1.5, 0, 0)),
+      xform(new THREE.SphereGeometry(0.036, 7, 6), V(0, -0.51, 0))
+    ]);
+    bristles(l[0], D, 7, 0.075, V(0.05, 0.42, 0.05), 1520 + i).position.y = -0.26;
+    bristles(l[1], D, 7, 0.06, V(0.04, 0.52, 0.04), 1540 + i).position.y = -0.32;
+    const cl = new THREE.Mesh(mg([
+      new THREE.ConeGeometry(0.03, 0.17, 5),
+      xform(new THREE.ConeGeometry(0.013, 0.07, 4), V(0.019, 0.045, 0), new THREE.Euler(0, 0, -0.9))
+    ]), B);
     cl.position.y = -0.085; cl.rotation.x = Math.PI; l.tip.add(cl);
     legs.push({ hip, l, sx, sz, i, planted: false });
   });
@@ -2192,68 +2520,99 @@ MOB.crawler = () => {
 /* ── WARDEN ── 3 m of plated mass, deliberately asymmetric: one arm overgrown,
    one leg ruined so the toe scrapes. Its chest is a hinged reliquary that cracks
    open around a furnace core; its fused faceplate splits vertically and the eye
-   cluster fans outward to lock on. */
+   cluster fans outward to lock on. Now riveted, crowned with spikes, branded
+   across the sternum, and venting through two stacks that flare when the
+   reliquary opens. */
 MOB.warden = () => {
   const root = new THREE.Group();
   const F = MATS.flesh, B = MATS.boneWet, PL = MATS.plateM, C = MATS.chainM;
   const lean = J(root), hips = J(lean, 0, 1.50, 0);
 
-  const gut = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.60, 12, 10), 0.09, 2101), F);
+  const gut = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.60, 13, 11), 0.09, 2101), F);
   gut.scale.set(1.05, 0.92, 0.90); hips.add(gut);
   mergeMesh(hips, PL, [
     xform(new THREE.BoxGeometry(0.98, 0.16, 0.66), V(0, 0.06, 0)),
     xform(new THREE.BoxGeometry(0.24, 0.30, 0.18), V(-0.36, -0.10, 0.12), new THREE.Euler(0, 0.3, 0)),
-    xform(new THREE.BoxGeometry(0.24, 0.30, 0.18), V(0.36, -0.10, 0.12), new THREE.Euler(0, -0.3, 0))
+    xform(new THREE.BoxGeometry(0.24, 0.30, 0.18), V(0.36, -0.10, 0.12), new THREE.Euler(0, -0.3, 0)),
+    xform(new THREE.BoxGeometry(0.44, 0.22, 0.14), V(0, -0.16, -0.52), new THREE.Euler(0.25, 0, 0))
   ]);
+  studs(hips, B, 16, V(0.94, 0.14, 0.60), 2105).position.y = 0.07;
   const chest = J(hips, 0, 0.48, 0);
-  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.50, 0.50, 6, MQ.seg + 2), 0.08, 2201), F);
+  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.50, 0.50, 7, MQ.seg + 2), 0.08, 2201), F);
   trunk.position.y = 0.20; trunk.scale.set(1.20, 1, 0.86); chest.add(trunk);
   const backPlates = [];
-  for (let i = 0; i < 7; i++)
-    backPlates.push(xform(jitter(new THREE.BoxGeometry(0.55 - i * 0.05, 0.10, 0.17), 0.03, 2300 + i),
-      V(0, 0.60 - i * 0.15, 0.34), new THREE.Euler(-0.5, 0, 0)));
+  for (let i = 0; i < 8; i++)
+    backPlates.push(xform(jitter(new THREE.BoxGeometry(0.55 - i * 0.045, 0.10, 0.17), 0.03, 2300 + i),
+      V(0, 0.62 - i * 0.14, 0.34), new THREE.Euler(-0.5, 0, 0)));
   mergeMesh(chest, PL, backPlates);
-  ribCage(chest, 6, B, 0.52, 0.14, 0.50);
+  studs(chest, B, 20, V(0.52, 0.90, 0.10), 2310).position.set(0, 0.28, 0.36);
+  ribCage(chest, 7, B, 0.52, 0.13, 0.52);
+  mergeMesh(chest, B, [                                    // brand plate bolted to the sternum
+    xform(new THREE.BoxGeometry(0.30, 0.20, 0.035), V(0, -0.02, -0.44)),
+    ...Array.from({ length: 4 }, (_, i) => xform(new THREE.SphereGeometry(0.019, 6, 5),
+      V(-0.12 + (i % 2) * 0.24, -0.09 + ((i >> 1) * 0.15), -0.46)))
+  ]);
+  /* vent stacks — they breathe the furnace out through their own back */
+  const stacks = [];
+  for (const s of [-1, 1]) {
+    const st = J(chest, s * 0.30, 0.66, 0.30);
+    st.rotation.x = -0.32; st.userData.base = st.rotation.clone();
+    mergeMesh(st, PL, [
+      xform(new THREE.CylinderGeometry(0.062, 0.076, 0.40, 8), V(0, 0.18, 0)),
+      xform(new THREE.TorusGeometry(0.068, 0.014, 4, 10), V(0, 0.36, 0), new THREE.Euler(1.57, 0, 0))
+    ]);
+    const mouth = new THREE.Mesh(new THREE.SphereGeometry(0.052, 9, 7), MATS.core);
+    mouth.position.y = 0.37; st.add(mouth);
+    stacks.push({ j: st, mouth, s });
+  }
 
   /* reliquary: two hinged half-shells over a pulsing core */
-  const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.20, 1), MATS.core);
+  const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.20, 2), MATS.core);
   core.position.set(0, 0.30, -0.10); chest.add(core);
   const coreLight = new THREE.PointLight(0xff7326, 0, 9, 2);
   coreLight.position.set(0, 0.30, -0.22); chest.add(coreLight);
   const shells = [];
   for (const s of [-1, 1]) {
     const hinge = J(chest, s * 0.08, 0.30, -0.04);
-    const sh = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.40, 12, 10, s < 0 ? 0 : Math.PI, Math.PI, 0.35, 2.2), 0.025, 2400 + s), PL);
+    const sh = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.40, 13, 11, s < 0 ? 0 : Math.PI, Math.PI, 0.35, 2.2), 0.025, 2400 + s), PL);
     sh.scale.set(1, 1.02, 0.80); hinge.add(sh);
-    mergeMesh(hinge, B, Array.from({ length: 5 }, (_, i) =>
-      xform(new THREE.SphereGeometry(0.022, 6, 5), V(s * 0.06, -0.22 + i * 0.11, -0.30))));
+    mergeMesh(hinge, B, Array.from({ length: 6 }, (_, i) =>
+      xform(new THREE.SphereGeometry(0.022, 6, 5), V(s * 0.06, -0.24 + i * 0.10, -0.30))));
+    mergeMesh(hinge, B, Array.from({ length: 4 }, (_, i) =>   // shell teeth along the seam
+      xform(new THREE.ConeGeometry(0.026, 0.11, 4), V(s * 0.035, -0.16 + i * 0.13, -0.34),
+        new THREE.Euler(0, 0, s * -1.4))));
     shells.push({ hinge, s });
   }
   const chains = [];
   for (let i = 0; i < 4; i++) {
     const cg = J(chest, -0.48 + i * 0.32, 0.30, 0.34);
     const linkParts = [];
-    for (let k = 0; k < 6; k++)
-      linkParts.push(xform(new THREE.TorusGeometry(0.036, 0.011, 4, 7), V(0, -0.06 - k * 0.07, 0),
+    for (let k = 0; k < 7; k++)
+      linkParts.push(xform(new THREE.TorusGeometry(0.036, 0.011, 4, 8), V(0, -0.06 - k * 0.07, 0),
         new THREE.Euler(k % 2 ? Math.PI / 2 : 0, 0, 0)));
-    linkParts.push(xform(new THREE.TorusGeometry(0.052, 0.014, 4, 9, Math.PI * 1.3), V(0, -0.53, 0)));
+    linkParts.push(xform(new THREE.TorusGeometry(0.052, 0.014, 4, 9, Math.PI * 1.3), V(0, -0.60, 0)));
     mergeMesh(cg, C, linkParts);
     chains.push(cg);
   }
 
   const head = J(chest, 0, 0.70, 0);
-  const hskull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.30, 12, 10), 0.04, 2401), F);
+  const hskull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.30, 13, 11), 0.04, 2401), F);
   hskull.scale.set(1, 0.95, 1.05); head.add(hskull);
-  const maw = new THREE.Mesh(new THREE.SphereGeometry(0.21, 10, 8), MATS.maw);
+  spikeBand(head, B, 9, 0.21, 0.24, 0.14, -0.55, 2405);        // crown
+  mergeMesh(head, PL, [                                        // cranial band
+    xform(new THREE.TorusGeometry(0.285, 0.028, 5, 16), V(0, 0.08, 0), new THREE.Euler(0.12, 0, 0))
+  ]);
+  const maw = new THREE.Mesh(new THREE.SphereGeometry(0.21, 11, 9), MATS.maw);
   maw.position.z = -0.10; head.add(maw);
   teethRing(head, MQ.teeth, 0.19, 0.03, B, Math.PI * 1.35,  1).position.set(0,  0.10, -0.06);
   teethRing(head, MQ.teeth, 0.19, 0.03, B, Math.PI * 1.35, -1).position.set(0, -0.10, -0.06);
+  teethRing(head, 8, 0.115, 0.018, B, Math.PI * 2, 1).position.set(0, 0, -0.02);
   const tongue = chain(head, [[0.22, 0.05, 0.038], [0.20, 0.038, 0.018]], MATS.sinew, 2600);
   tongue[0].position.set(0, -0.02, -0.12);
   const faceplates = [];
   for (const s of [-1, 1]) {
     const hinge = J(head, s * 0.11, 0.02, -0.06);
-    const pm = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.30, 11, 9, 0, Math.PI), 0.022, 2500 + s), B);
+    const pm = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.30, 12, 10, 0, Math.PI), 0.022, 2500 + s), B);
     pm.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
     pm.scale.set(0.62, 1.06, 1.0); pm.position.z = -0.09;
     for (let i = 0; i < 3; i++) {
@@ -2261,11 +2620,13 @@ MOB.warden = () => {
       hn.position.set(s * (0.07 + i * 0.04), 0.16 - i * 0.05, 0.02);
       hn.rotation.set(-0.3, 0, s * (0.3 + i * 0.2)); hinge.add(hn);
     }
-    hinge.add(pm); faceplates.push({ hinge, s });
+    hinge.add(pm);
+    studs(hinge, PL, 6, V(0.10, 0.42, 0.06), 2510 + s).position.set(s * 0.09, 0, -0.14);
+    faceplates.push({ hinge, s });
   }
   const eyes = [];
-  for (let i = 0; i < 7; i++) {
-    const a = i / 7 * 6.283;
+  for (let i = 0; i < 9; i++) {
+    const a = i / 9 * 6.283;
     const e = makeEye(head, 0.026, Math.cos(a) * 0.05, Math.sin(a) * 0.05, -0.10);
     e.ang = a; eyes.push(e);
   }
@@ -2275,17 +2636,22 @@ MOB.warden = () => {
     const big = s > 0;                                     // right arm is overgrown
     const sh = J(chest, s * (big ? 0.66 : 0.58), big ? 0.38 : 0.44, 0);
     mergeMesh(sh, PL, [
-      xform(new THREE.SphereGeometry(big ? 0.30 : 0.20, 10, 8, 0, 6.3, 0, 1.6), V(0, 0.02, 0)),
-      ...Array.from({ length: 6 }, (_, i) => xform(new THREE.ConeGeometry(0.045, 0.17, 4),
-        V(Math.cos(i / 6 * 6.283) * (big ? 0.21 : 0.15), 0.06, Math.sin(i / 6 * 6.283) * (big ? 0.21 : 0.15)),
+      xform(new THREE.SphereGeometry(big ? 0.30 : 0.20, 11, 9, 0, 6.3, 0, 1.6), V(0, 0.02, 0)),
+      ...Array.from({ length: 7 }, (_, i) => xform(new THREE.ConeGeometry(0.045, 0.17, 4),
+        V(Math.cos(i / 7 * 6.283) * (big ? 0.21 : 0.15), 0.06, Math.sin(i / 7 * 6.283) * (big ? 0.21 : 0.15)),
         new THREE.Euler(-0.4, 0, 0)))
     ]);
+    studs(sh, B, 9, V(big ? 0.40 : 0.28, 0.12, big ? 0.40 : 0.28), 2650 + s);
     const spec = big ? [[0.78, 0.21, 0.17], [0.82, 0.17, 0.14]] : [[0.64, 0.17, 0.135], [0.66, 0.135, 0.11]];
     const a = chain(sh, spec, F, 2700 + s * 11);
+    mergeMesh(a[1], PL, [                                  // forearm bracer
+      xform(jitter(new THREE.CylinderGeometry(big ? 0.19 : 0.15, big ? 0.16 : 0.13, 0.30, 8, 1, true), 0.014, 2710 + s), V(0, -0.34, 0)),
+      xform(new THREE.TorusGeometry(big ? 0.185 : 0.148, 0.017, 4, 12), V(0, -0.20, 0), new THREE.Euler(1.57, 0, 0))
+    ]);
     const size = big ? 0.28 : 0.22;
-    const clubParts = [jitter(new THREE.SphereGeometry(size, 10, 8), size * 0.22, 2800 + s)];
-    for (let i = 0; i < 5; i++) {
-      const ang = i / 5 * 6.283;
+    const clubParts = [jitter(new THREE.SphereGeometry(size, 11, 9), size * 0.22, 2800 + s)];
+    for (let i = 0; i < 7; i++) {
+      const ang = i / 7 * 6.283;
       clubParts.push(xform(new THREE.ConeGeometry(size * 0.19, size * 0.85, 5),
         V(Math.cos(ang) * size * 0.72, -size * 0.62, Math.sin(ang) * size * 0.72), new THREE.Euler(1.6, 0, ang)));
     }
@@ -2297,65 +2663,91 @@ MOB.warden = () => {
   for (const s of [-1, 1]) {
     const hip = J(hips, s * 0.30, -0.20, 0);
     const l = chain(hip, [[0.66, 0.22, 0.18], [0.66, 0.18, 0.14]], F, 2900 + s * 3);
+    mergeMesh(l[0], PL, [                                  // knee guard
+      xform(jitter(new THREE.SphereGeometry(0.17, 9, 7, 0, 6.3, 0, 1.4), 0.014, 2910 + s), V(0, -0.62, -0.06)),
+      xform(new THREE.ConeGeometry(0.05, 0.18, 4), V(0, -0.66, -0.15), new THREE.Euler(-1.2, 0, 0))
+    ]);
     const foot = J(l.tip);
     mergeMesh(foot, PL, [
       xform(jitter(new THREE.BoxGeometry(0.32, 0.15, 0.52), 0.03, 3000 + s), V(0, 0, -0.08)),
       xform(new THREE.ConeGeometry(0.05, 0.16, 4), V(-0.08, -0.02, -0.34), new THREE.Euler(-1.5, 0, 0)),
-      xform(new THREE.ConeGeometry(0.05, 0.16, 4), V(0.08, -0.02, -0.34), new THREE.Euler(-1.5, 0, 0))
+      xform(new THREE.ConeGeometry(0.05, 0.16, 4), V(0.08, -0.02, -0.34), new THREE.Euler(-1.5, 0, 0)),
+      xform(new THREE.BoxGeometry(0.26, 0.10, 0.16), V(0, 0.05, 0.19), new THREE.Euler(-0.3, 0, 0))
     ]);
     legs.push({ hip, l, foot, s, ruined: s > 0, planted: false });
   }
   const light = new THREE.PointLight(0xff2200, 0, 9, 2); light.position.z = -0.12; head.add(light);
-  root.userData.rig = { type: 'warden', lean, hips, chest, head, faceplates, shells, core, coreLight, maw, tongue, eyes, arms, legs, chains, light, restHip: 1.50 };
+  root.userData.rig = { type: 'warden', lean, hips, chest, head, faceplates, shells, core, coreLight, stacks, maw, tongue, eyes, arms, legs, chains, light, restHip: 1.50 };
   return root;
 };
 
-/* ── WATCHER ── legless, robed, a ring of eyes orbiting a bare skull. It does
-   not animate at all while you are looking at it. That is the whole point. */
+/* ── WATCHER ── legless, robed, a ring of eyes orbiting a bare skull under a
+   halo of fused bone. It does not animate at all while you are looking at it,
+   and it never runs — it creeps toward you in short blink-steps only while
+   unobserved. The ring on the ground is its reach. Once you are inside it, the
+   thing stops moving entirely and starts closing its hands; look straight at it
+   and the grab unwinds twice as fast as simply retreating. */
 MOB.watcher = () => {
   const root = new THREE.Group();
   const C = MATS.cloth, B = MATS.boneWet, D = MATS.fleshD;
   const body = J(root, 0, 0.10, 0);
 
   const pts = [];
-  for (let i = 0; i <= 15; i++) { const t = i / 15; pts.push(new THREE.Vector2(0.05 + Math.sin(t * 2.25) * 0.5 + t * 0.06, t * 2.3)); }
-  const robeGeo = new THREE.LatheGeometry(pts, 26);
+  for (let i = 0; i <= 20; i++) { const t = i / 20; pts.push(new THREE.Vector2(0.05 + Math.sin(t * 2.25) * 0.5 + t * 0.06, t * 2.3)); }
+  const robeGeo = new THREE.LatheGeometry(pts, 30);
   jitter(robeGeo, 0.018, 3050);
   robeGeo.userData.base = Float32Array.from(robeGeo.attributes.position.array);
   const robe = new THREE.Mesh(robeGeo, C); body.add(robe);
+  mergeMesh(body, D, [                                     // sodden hem trim + cord belt
+    xform(new THREE.TorusGeometry(0.53, 0.020, 4, 26), V(0, 0.06, 0), new THREE.Euler(1.57, 0, 0)),
+    xform(new THREE.TorusGeometry(0.40, 0.017, 4, 22), V(0, 1.28, 0), new THREE.Euler(1.57, 0, 0)),
+    xform(new THREE.CylinderGeometry(0.012, 0.008, 0.34, 4), V(0.30, 1.12, -0.24))
+  ]);
   const strips = [];
   for (let i = 0; i < MQ.strips; i++) {
     const a = i / MQ.strips * 6.283;
     const j = J(body, Math.cos(a) * 0.52, 1.10, Math.sin(a) * 0.52);
     j.rotation.y = -a; j.userData.base = j.rotation.clone();
     const h = 0.9 + Math.random() * 0.6;
-    const st = new THREE.Mesh(new THREE.PlaneGeometry(0.18 + Math.random() * 0.1, h, 1, 3), C);
+    const st = new THREE.Mesh(new THREE.PlaneGeometry(0.18 + Math.random() * 0.1, h, 1, 4), C);
     st.position.y = -h / 2; j.add(st);
     strips.push({ j, ph: Math.random() * 6.3 });
   }
 
   const shoulders = J(body, 0, 2.00, 0);
-  const hood = new THREE.Mesh(jitter(new THREE.ConeGeometry(0.34, 0.66, 12, 2, true), 0.022, 3101), C);
+  const hood = new THREE.Mesh(jitter(new THREE.ConeGeometry(0.34, 0.66, 14, 3, true), 0.022, 3101), C);
   hood.position.y = 0.20; shoulders.add(hood);
+  mergeMesh(shoulders, D, [
+    xform(new THREE.TorusGeometry(0.335, 0.019, 4, 18), V(0, -0.10, 0), new THREE.Euler(1.57, 0, 0))
+  ]);
   const head = J(shoulders, 0, 0.14, 0);
-  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.15, 12, 10), 0.02, 3201), B);
+  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.15, 13, 11), 0.02, 3201), B);
   skull.scale.set(0.90, 1.10, 0.95); head.add(skull);
-  teethRing(head, 10, 0.10, 0.016, B, Math.PI * 1.1, 1).position.set(0, -0.06, -0.04);
+  teethRing(head, 12, 0.10, 0.016, B, Math.PI * 1.1, 1).position.set(0, -0.06, -0.04);
+  /* halo of fused vertebrae — the only part of it that ever turns */
+  const halo = J(head, 0, 0.16, 0.02);
+  mergeMesh(halo, B, [
+    xform(new THREE.TorusGeometry(0.24, 0.014, 4, 30), V(0, 0, 0), new THREE.Euler(1.45, 0, 0)),
+    ...Array.from({ length: 12 }, (_, i) => xform(new THREE.ConeGeometry(0.020, 0.10, 4),
+      V(Math.cos(i / 12 * 6.283) * 0.24, 0, Math.sin(i / 12 * 6.283) * 0.24),
+      new THREE.Euler(0, -i / 12 * 6.283, i % 2 ? 0.5 : -0.5)))
+  ]);
   const ring = J(head);
   const eyes = [];
-  for (let i = 0; i < 7; i++) {
-    const a = i / 7 * 6.283;
+  for (let i = 0; i < 9; i++) {
+    const a = i / 9 * 6.283;
     eyes.push(makeEye(ring, 0.033, Math.cos(a) * 0.27, Math.sin(a) * 0.14, -0.09, MATS.irisC));
   }
   const ringEyes = [];
-  for (let i = 0; i < 8; i++) {
-    const a = i / 8 * 6.283;
+  for (let i = 0; i < 10; i++) {
+    const a = i / 10 * 6.283;
     ringEyes.push(makeEye(body, 0.026, Math.cos(a) * 0.30, 1.72, Math.sin(a) * 0.30, MATS.irisC));
   }
   const arms = [];
   for (const s of [-1, 1]) {
     const sh = J(shoulders, s * 0.25, -0.06, 0);
     const a = chain(sh, [[0.56, 0.055, 0.042], [0.60, 0.042, 0.030]], MATS.fleshP, 3300 + s);
+    mergeMesh(a[0], B, [xform(new THREE.SphereGeometry(0.042, 7, 6), V(0, -0.55, 0))]);
     const hand = clawHand(a.tip, MATS.fleshP, B, 0.10, 4);
     arms.push({ sh, a, hand, s });
   }
@@ -2366,7 +2758,11 @@ MOB.watcher = () => {
     tend.push({ c: chain(t, [[0.40, 0.020, 0.013], [0.40, 0.013, 0.005]], D, 3400 + i * 13), a });
   }
   const light = new THREE.PointLight(0x8fe6ff, 0, 12, 2); light.position.y = 2.20; body.add(light);
-  root.userData.rig = { type: 'watcher', body, robe, strips, shoulders, head, ring, eyes, ringEyes, arms, tend, light };
+  /* its reach, drawn on the floor. Additive, depth-write off, so it never
+     z-fights the ground plane and never occludes what is standing on it. */
+  const zone = makeZoneRing(CFG.WATCHER_ATTACK);
+  root.add(zone);
+  root.userData.rig = { type: 'watcher', body, robe, strips, shoulders, head, halo, ring, eyes, ringEyes, arms, tend, light, zone };
   return root;
 };
 
@@ -2383,37 +2779,44 @@ function makeHollowAvatar() {
   const F = MATS.flesh, D = MATS.fleshD, B = MATS.boneWet;
 
   const head = new THREE.Group();
-  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.20, 12, 10), 0.028, 7001), B);
+  const skull = new THREE.Mesh(jitter(new THREE.SphereGeometry(0.20, 13, 11), 0.028, 7001), B);
   skull.scale.set(0.86, 1.16, 0.96); head.add(skull);
+  spikeBand(head, B, 7, 0.14, 0.17, 0.09, -0.35, 7005);
   const petals = [];
   for (let i = 0; i < 4; i++) {
     const p = J(head); p.rotation.z = i * Math.PI / 2; p.userData.base = p.rotation.clone();
     const blade = new THREE.Mesh(mg([
-      jitter(new THREE.ConeGeometry(0.088, 0.45, 6, 1, true), 0.02, 7010 + i),
-      xform(teethGeo(6, 0.058, 0.021, Math.PI * 1.2, 1), V(0, -0.18, 0))
+      jitter(new THREE.ConeGeometry(0.088, 0.45, 7, 1, true), 0.02, 7010 + i),
+      xform(teethGeo(7, 0.058, 0.021, Math.PI * 1.2, 1), V(0, -0.18, 0))
     ]), D);
     blade.rotation.x = -1.35; blade.position.set(0, -0.02, -0.21); p.add(blade);
     petals.push(p);
   }
-  const gullet = new THREE.Mesh(new THREE.SphereGeometry(0.10, 9, 7), MATS.maw);
+  const gullet = new THREE.Mesh(new THREE.SphereGeometry(0.10, 10, 8), MATS.maw);
   gullet.position.z = -0.13; head.add(gullet);
+  teethRing(head, MQ.teeth, 0.078, 0.016, B, Math.PI * 2, 1).position.set(0, 0, -0.10);
   const eyes = [];
-  for (const s of [-1, 1]) for (let i = 0; i < 3; i++)
-    eyes.push(makeEye(head, 0.026 - i * 0.004, s * (0.10 + i * 0.016), 0.07 - i * 0.05, -0.115 - i * 0.012));
+  for (const s of [-1, 1]) for (let i = 0; i < 4; i++)
+    eyes.push(makeEye(head, 0.027 - i * 0.004, s * (0.10 + i * 0.014), 0.075 - i * 0.042, -0.115 - i * 0.011));
   const glow = new THREE.PointLight(0xff2a10, 0.9, 8, 2); head.add(glow);
 
   const torso = new THREE.Group();
-  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.24, 0.36, 5, MQ.seg), 0.04, 7101), F);
+  const trunk = new THREE.Mesh(jitter(new THREE.CapsuleGeometry(0.24, 0.36, 6, MQ.seg), 0.04, 7101), F);
   trunk.position.y = -0.28; trunk.scale.set(1.10, 0.68, 0.75); torso.add(trunk);
-  ribCage(torso, MQ.ribs, B, 0.22, 0.07, -0.08);
-  spineKnobs(torso, 5, B, 0.04, 0.08, -0.04, 0.14);
-  const gut = makeStrands(torso, 5, -0.22, 0.22, 0.16, MATS.sinew);
+  ribCage(torso, MQ.ribs, B, 0.22, 0.065, -0.06);
+  spineKnobs(torso, 6, B, 0.04, 0.075, -0.04, 0.14);
+  spikeBand(torso, B, 5, 0.20, 0.16, -0.10, -0.9, 7105, 0.4);
+  const gut = makeStrands(torso, 6, -0.22, 0.22, 0.16, MATS.sinew);
   const legs = [];
   for (const s of [-1, 1]) {
     const hip = J(torso, s * 0.16, -0.52, 0);
     const l = chain(hip, [[0.72, 0.12, 0.088], [0.80, 0.088, 0.058]], F, 7200 + s * 7);
+    mergeMesh(l[0], B, [xform(new THREE.SphereGeometry(0.052, 7, 6), V(0, -0.70, -0.04))]);
     const foot = J(l.tip);
-    const fm = new THREE.Mesh(jitter(new THREE.BoxGeometry(0.15, 0.07, 0.34), 0.02, 7300 + s), D);
+    const fm = new THREE.Mesh(mg([
+      jitter(new THREE.BoxGeometry(0.15, 0.07, 0.34), 0.02, 7300 + s),
+      xform(new THREE.ConeGeometry(0.024, 0.14, 5), V(0, -0.02, -0.21), new THREE.Euler(-1.75, 0, 0))
+    ]), D);
     fm.position.set(0, -0.03, -0.09); foot.add(fm);
     legs.push({ l, foot, s });
   }
@@ -2474,7 +2877,8 @@ function watcherObserved(m) {
 
 const ANIM = {
   /* Stilt-walk on hyperextended reverse knees. On entering a chase it rears and
-     screams: mandible bloom fully open, ribcage flaring around the cavity.
+     screams: mandible bloom fully open, ribcage flaring around the cavity,
+     throat sac swelling, neck cords drawn taut.
      While hunting the head twitches at 13 Hz — insect frequency, not human. */
   stalker(m, dt, R, C) {
     const t = nowS();
@@ -2519,6 +2923,12 @@ const ANIM = {
     m.open = lerp(m.open, want, 1 - Math.exp(-11 * dt));
     R.petals.forEach((p, i) => setRot(p, -m.open * (0.95 + i * 0.05) - 0.04, 0, 0));
     R.gullet.scale.setScalar(0.7 + m.open * 1.6);
+    // throat sac inflates on the scream and pumps with the breath
+    R.throat.scale.set(1 + m.open * 0.85 + breath * 0.06, 0.9 + m.open * 1.15, 0.7 + m.open * 0.9);
+    R.cords.forEach((c, i) => {
+      c.scale.y = 1 + m.open * 0.55 + scr * 0.25;
+      c.rotation.z = Math.sin(t * 3.1 + i) * 0.06 - m.open * 0.12;
+    });
     R.drool.forEach(d => setRot(d.j, Math.sin(t * 2.1 + d.ph) * 0.35 + m.open * 0.5, 0, Math.sin(t * 1.7 + d.ph) * 0.3));
     R.gutStrands.forEach(s => setRot(s.j, Math.sin(t * 2.6 + s.ph) * 0.3 - sp * 0.35, 0, Math.sin(t * 2.1 + s.ph) * 0.25));
 
@@ -2527,6 +2937,7 @@ const ANIM = {
       (C.chase ? 0.16 : 0) - scr * 0.5 + Math.sin(t * 13.7) * 0.05 * tw,
       Math.sin(t * (C.chase ? 1.4 : 0.5) + m.seedA) * (C.chase ? 0.14 : 0.62) + Math.sin(t * 17) * 0.04 * tw,
       Math.sin(t * 11.3) * 0.08 * tw);
+    setRot(R.neck, -scr * 0.28 + Math.sin(t * 1.9) * 0.04, 0, 0);
     setRot(R.lean, C.lunge * 0.55 + sp * 0.06 - C.windup * 0.25 - scr * 0.45, 0, 0);
     R.eyes.forEach(e => { eyeBlink(e, dt, C.chase ? 5.5 : 2.6); e.iris.scale.setScalar(lerp(1.2, 0.6, C.alert)); });
   },
@@ -2567,8 +2978,9 @@ const ANIM = {
     m.open = lerp(m.open, clamp(chat + C.windup + C.roar, 0, 1), 1 - Math.exp(-14 * dt));
     R.mand.forEach(md => { setRot(md, -m.open * 1.15, 0, 0); md.position.z = -0.11 - m.open * 0.02; });
     R.rings.forEach((r, i) => {
-      r.position.z = -0.13 - i * 0.03 + m.open * (0.05 + i * 0.02);
+      r.position.z = -0.125 - i * 0.024 + m.open * (0.05 + i * 0.018);
       r.rotation.z += dt * (2 + m.open * 12) * (i % 2 ? 1 : -1);
+      r.scale.setScalar(1 + m.open * 0.25 * (1 - i / R.rings.length));
     });
     R.maw.scale.setScalar(0.8 + m.open * 0.6);
     R.hair.rotation.set(Math.sin(t * 3) * 0.22 + sp * 0.45, 0, Math.sin(t * 2.3) * 0.18);
@@ -2578,8 +2990,8 @@ const ANIM = {
 
   /* Two-beat lurch with real weight transfer: the good leg strides and thuds,
      the ruined leg drags and never fully lifts. Chest reliquary cracks open
-     around the core when it acquires you; the faceplate splits and the eye
-     cluster fans outward to lock on. */
+     around the core when it acquires you; the faceplate splits, the eye cluster
+     fans outward to lock on, and the back stacks vent. */
   warden(m, dt, R, C) {
     const t = nowS();
     m.gait += dt * (0.55 + C.speed * 0.9);
@@ -2630,6 +3042,13 @@ const ANIM = {
     R.core.material = op > 0.05 ? MATS.core : MATS.coreOff;
     R.coreLight.intensity = op * 3.2 * beat + burst * 9;
     R.coreLight.distance = 9 + op * 8 + burst * 16;
+    // stacks vent in time with the furnace, harder on the burst
+    R.stacks.forEach((S, i) => {
+      const puff = clamp(op * (0.55 + 0.45 * Math.sin(t * (3.4 + i * 0.7) + i)) + burst * 0.8, 0, 1.6);
+      S.mouth.scale.setScalar(0.35 + puff * 1.15);
+      S.mouth.material = op > 0.04 || burst > 0.04 ? MATS.core : MATS.coreOff;
+      setRot(S.j, -op * 0.10, 0, S.s * Math.sin(t * 1.3 + i) * 0.05);
+    });
     R.faceplates.forEach(p => { setRot(p.hinge, 0, p.s * op * 1.0, p.s * op * 0.2); p.hinge.position.x = p.s * (0.11 + op * 0.09); });
     R.maw.scale.setScalar(0.8 + op * 0.75);
     R.tongue.forEach((s, i) => setRot(s, 1.25 + Math.sin(t * (4 + i * 2)) * 0.5 * op, 0, Math.sin(t * 3 + i) * 0.4 * op));
@@ -2646,12 +3065,23 @@ const ANIM = {
   },
 
   /* Stillness while observed — a hard early return, not a slower animation.
-     Everything it does, it does in the moment you glance away. */
+     Everything it does, it does in the moment you glance away. The floor ring
+     is the exception: it is drawn either way, because it is the one honest
+     warning the game gives you. */
   watcher(m, dt, R, C) {
     const t = nowS();
+    const grab = clamp(C.grab, 0, 1);
+    /* ring: idle glow scaled by nearness, then hard bloom as the grab winds up */
+    if (R.zone) {
+      const u = R.zone.material.uniforms;
+      const near = clamp(1 - (C.dist - CFG.WATCHER_ATTACK) / 12, 0, 1);
+      const want = clamp(near * 0.30 + grab * 0.95, 0, 1) * (C.observed ? 0.45 : 1);
+      u.uAmt.value = lerp(u.uAmt.value, want, 1 - Math.exp(-6 * dt));
+      R.zone.visible = u.uAmt.value > 0.01;
+    }
     if (C.observed) {
       R.ring.rotation.z = m.ringZ;
-      R.light.intensity = 1.5 + Math.sin(t * 1.4) * 0.10;
+      R.light.intensity = 1.5 + Math.sin(t * 1.4) * 0.10 + grab * 2.0;
       R.body.rotation.z = Math.sin(t * 47) * 0.0035;     // sub-degree tremor
       m.prevSeen = true;
       return;
@@ -2659,18 +3089,19 @@ const ANIM = {
     if (m.prevSeen && C.dist < 16) m.bloom = 1;          // every eye opens at once
     m.prevSeen = false;
     m.bloom = Math.max(0, m.bloom - dt * 0.8);
-    const bloom = m.bloom;
+    const bloom = Math.max(m.bloom, grab);
     m.punch = Math.max(0, m.punch - dt * 2.6);
     const punch = m.punch * m.punch;
     const near = 1 - clamp(C.dist / 40, 0, 1);
-    m.unfold = lerp(m.unfold, clamp(1 - (C.dist - 3) / 14, 0, 1), 1 - Math.exp(-3 * dt));
+    m.unfold = lerp(m.unfold, Math.max(grab, clamp(1 - (C.dist - 3) / 14, 0, 1)), 1 - Math.exp(-3 * dt));
     const unf = m.unfold;
 
-    m.ringZ += dt * (0.6 + near * 5.2);
+    m.ringZ += dt * (0.6 + near * 5.2 + grab * 7.0);
     R.ring.rotation.z = m.ringZ;
-    R.body.position.y = 0.10 + Math.sin(t * 0.9) * 0.09 - punch * 0.10;
+    if (R.halo) R.halo.rotation.y += dt * (0.25 + grab * 2.2);
+    R.body.position.y = 0.10 + Math.sin(t * 0.9) * 0.09 - punch * 0.10 + grab * 0.06;
     R.body.scale.set(1 + punch * 0.18, 1 - punch * 0.22, 1 + punch * 0.18);
-    setRot(R.body, m.lean * 0.4, 0, Math.sin(t * 0.55) * 0.05);
+    setRot(R.body, m.lean * 0.4 + grab * 0.10, 0, Math.sin(t * 0.55) * 0.05);
     m.lean = lerp(m.lean, 0.4, 1 - Math.exp(-4 * dt));
     setRot(R.shoulders, 0, Math.sin(t * 0.4) * 0.12, 0);
 
@@ -2683,29 +3114,31 @@ const ANIM = {
     p.needsUpdate = true;
 
     R.strips.forEach((s, i) => setRot(s.j,
-      Math.sin(t * 1.5 + s.ph) * 0.20 + punch * 0.55 + unf * 0.2,
+      Math.sin(t * 1.5 + s.ph) * 0.20 + punch * 0.55 + unf * 0.2 + grab * 0.35,
       Math.sin(t * 0.7 + i) * 0.12, Math.cos(t * 1.1 + s.ph) * 0.17));
     R.tend.forEach((T, i) => {
-      setRot(T.c[0], Math.sin(t * 1.6 + i) * 0.42, 0, Math.cos(t * 1.3 + i) * 0.30);
+      setRot(T.c[0], Math.sin(t * 1.6 + i) * 0.42 - grab * 0.5, 0, Math.cos(t * 1.3 + i) * 0.30);
       setRot(T.c[1], Math.sin(t * 2.2 + i * 0.7) * 0.60, 0, 0);
     });
     R.arms.forEach(A => {
-      setRot(A.a[0], lerp(2.3, -0.35, unf) + Math.sin(t * 1.2) * 0.08, 0, A.s * lerp(0.15, 1.15, unf));
-      setRot(A.a[1], lerp(-2.5, -0.5, unf), 0, 0);
-      const curl = lerp(1.15, -0.35, Math.max(unf, bloom));
+      // the grab pose: both arms come straight out and the hands close
+      setRot(A.a[0], lerp(2.3, -0.35, unf) - grab * 0.85 + Math.sin(t * 1.2) * 0.08 * (1 - grab), 0,
+        A.s * lerp(0.15, 1.15, unf) * (1 - grab * 0.55));
+      setRot(A.a[1], lerp(-2.5, -0.5, unf) + grab * 0.35, 0, 0);
+      const curl = lerp(1.15, -0.35, Math.max(unf, bloom)) + grab * 1.5;
       A.hand.userData.fingers.forEach(f => { setRot(f[0], curl, 0, 0); setRot(f[1], curl * 1.1, 0, 0); });
     });
     R.eyes.forEach((e, i) => {
       const open = Math.max(bloom, clamp(0.35 + Math.sin(t * 1.3 - i * 0.5) * 0.65, 0.05, 1));
       e.lidT.rotation.x = -open * 1.15; e.lidB.rotation.x = Math.PI + open * 1.15;
-      e.iris.scale.setScalar(lerp(1.1, 0.5, near));
+      e.iris.scale.setScalar(lerp(1.1, 0.5, Math.max(near, grab)));
     });
     R.ringEyes.forEach((e, i) => {
       const open = Math.max(bloom, clamp(unf * 1.4 - Math.abs(Math.sin(t * 0.8 + i)) * 0.3, 0, 1));
       e.lidT.rotation.x = -open * 1.15; e.lidB.rotation.x = Math.PI + open * 1.15;
     });
-    R.light.intensity = 1.0 + near * 1.6 + unf * 1.2 + bloom * 5.5 + punch * 4;
-    R.light.distance = 12 + bloom * 12;
+    R.light.intensity = 1.0 + near * 1.6 + unf * 1.2 + bloom * 5.5 + punch * 4 + grab * 4;
+    R.light.distance = 12 + bloom * 12 + grab * 10;
   }
 };
 
@@ -2732,6 +3165,8 @@ class Monster {
     this.bloom = 0; this.punch = 0; this.unfold = 0; this.lean = 0; this.ringZ = 0;
     this.prevSeen = true; this.prevState = '';
     this.seedA = Math.random() * 6.283; this.footFall = 0; this.skip = 0;
+    /* watcher-only: blink-step pacing and the grab it needs privacy to finish */
+    this.grab = 0; this.blinkCd = CFG.WATCHER_CD; this.stepping = false; this.stepTo = V();
   }
   dispose() { scene.remove(this.mesh); AUD.voiceKill(this.id); }
 
@@ -2892,35 +3327,97 @@ class Monster {
     this.growlT -= dt;
   }
 
-  /* the Watcher does not run. It arrives. */
+  /* The Watcher does not run. It arrives, one blink-step at a time, and only
+     while nothing is looking at it. Inside CFG.WATCHER_ATTACK it stops moving
+     completely and starts closing: grab fills over WATCHER_WINDUP seconds of
+     privacy. Eye contact drains that grab at twice the rate that simply
+     stepping out of the ring does — looking at it is always the better answer. */
   simWatcher(dt, targets) {
-    let observed = false, nearest = null, nd = 1e9;
+    let observed = false, nearest = null, nd = 1e9, nearestSeesIt = false;
     for (const t of targets) {
       const d = this.pos.distanceTo(t.pos);
-      if (d < nd) { nd = d; nearest = t; }
-      if (d < 45) {
-        const toM = _v1.copy(this.pos).sub(t.pos).normalize();
-        const fwd = _v2.set(0, 0, -1).applyQuaternion(t.quat);
-        const eye = _v3.copy(this.pos); eye.y += 2.2;
-        if (toM.dot(fwd) > 0.5 && !losBlocked(_v4.copy(t.pos), eye)) observed = true;
+      let sees = false;
+      if (d < 62) {
+        const toM = _v1.copy(this.pos).sub(t.pos); toM.y = 0;
+        if (toM.lengthSq() > 1e-6) {
+          toM.normalize();
+          const fwd = _v2.set(0, 0, -1).applyQuaternion(t.quat); fwd.y = 0;
+          if (fwd.lengthSq() > 1e-6) {
+            fwd.normalize();
+            const eye = _v3.copy(this.pos); eye.y += 2.2;
+            if (toM.dot(fwd) > 0.5 && !losBlocked(_v4.copy(t.pos), eye)) { sees = true; observed = true; }
+          }
+        }
+      }
+      if (d < nd) { nd = d; nearest = t; nearestSeesIt = sees; }
+    }
+    this.alert = clamp(1 - nd / 40, 0, 1);
+
+    if (!nearest) { this.grab = Math.max(0, this.grab - dt); this.stepping = false; return; }
+
+    // it only turns when nothing is watching; caught mid-turn it stays mid-turn
+    if (!observed) this.yaw = Math.atan2(-(nearest.pos.x - this.pos.x), -(nearest.pos.z - this.pos.z));
+
+    const inReach = nd <= CFG.WATCHER_ATTACK;
+    if (inReach) {
+      this.stepping = false;
+      if (observed) {
+        // eye contact prises the hands back open, fast
+        this.grab = Math.max(0, this.grab - dt * 2.0);
+      } else {
+        if (this.grab <= 0.001) this.roarNow(0.55);        // the one warning you get
+        this.grab += dt;
+        if (this.grab >= CFG.WATCHER_WINDUP) {
+          this.grab = 0; this.punch = 1;
+          this.blinkCd = CFG.WATCHER_CD * 2;
+          GAME.hostDown(nearest.id, this.pos, this.id);
+          NET.event({ e: 'wpunch', m: this.id });
+        }
+      }
+      return;
+    }
+    // out of reach: the grab unwinds at the base rate whether it is watched or not
+    this.grab = Math.max(0, this.grab - dt * (observed ? 2.0 : 1.0));
+    if (observed) { this.stepping = false; return; }
+
+    /* blink-step. The cooldown runs during the glide too, so the effective
+       advance is WATCHER_STEP / WATCHER_CD ≈ 1.7 m/s — walking pace, forever. */
+    this.blinkCd -= dt;
+    if (!this.stepping && this.blinkCd <= 0) {
+      const dir = _v1.copy(nearest.pos).sub(this.pos); dir.y = 0;
+      if (dir.lengthSq() > 1e-6) {
+        dir.normalize();
+        const step = Math.min(CFG.WATCHER_STEP, nd - CFG.WATCHER_ATTACK * 0.92);
+        if (step > 0.15) {
+          const np = _v2.copy(this.pos).addScaledVector(dir, step);
+          const gy = groundY(np.x, np.z, np.y + 2);
+          np.y = gy > -100 ? gy : this.pos.y;
+          const probe = _v3.copy(np); probe.y += 1.2;
+          if (!resolveSphere(probe, 0.5, _push).hit && !inShelter(np)) {
+            this.stepTo.copy(np); this.stepping = true; this.punch = 1;
+            this.blinkCd = CFG.WATCHER_CD;
+            if (nd < 15) NET.event({ e: 'wpunch', m: this.id });
+          } else {
+            // blocked head-on: sidestep instead of grinding into the geometry
+            const side = _v3.set(-dir.z, 0, dir.x).multiplyScalar(Math.random() < 0.5 ? 1 : -1);
+            const sp2 = _v2.copy(this.pos).addScaledVector(side, CFG.WATCHER_STEP * 0.8);
+            const gy2 = groundY(sp2.x, sp2.z, sp2.y + 2);
+            sp2.y = gy2 > -100 ? gy2 : this.pos.y;
+            const pr2 = _v4.copy(sp2); pr2.y += 1.2;
+            if (!resolveSphere(pr2, 0.5, _push).hit && !inShelter(sp2)) { this.stepTo.copy(sp2); this.stepping = true; }
+            this.blinkCd = CFG.WATCHER_CD * 0.6;
+          }
+        } else this.blinkCd = CFG.WATCHER_CD * 0.5;
       }
     }
-    if (nearest) this.yaw = Math.atan2(-(nearest.pos.x - this.pos.x), -(nearest.pos.z - this.pos.z));
-    if (!observed && nearest && this.teleCd <= 0 && nd > 2.2) {
-      const step = Math.min(nd - 1.6, 7 + Math.random() * 7);
-      const dir = _v1.copy(nearest.pos).sub(this.pos); dir.y = 0; dir.normalize();
-      const np = _v2.copy(this.pos).addScaledVector(dir, step);
-      const gy = groundY(np.x, np.z, np.y + 2);
-      np.y = gy > -100 ? gy : this.pos.y;
-      const probe = _v3.copy(np); probe.y += 1.2;
-      if (!resolveSphere(probe, 0.5, _push).hit && !inShelter(np)) {
-        this.pos.copy(np); this.teleCd = 0.6; this.punch = 1;
-        if (nd < 14) this.roarNow(0.6);
-      } else this.teleCd = 0.3;
-    }
-    if (nearest && nd < (this.T.reach || CFG.MON_KILL) + 0.4 && !observed) {
-      GAME.hostDown(nearest.id, this.pos, this.id);
-      this.teleCd = 7;
+    if (this.stepping) {
+      const to = _v1.copy(this.stepTo).sub(this.pos);
+      const rem = to.length();
+      const glide = 9.0 * dt;
+      if (rem <= glide || rem < 0.02) { this.pos.copy(this.stepTo); this.stepping = false; }
+      else this.pos.addScaledVector(to.multiplyScalar(1 / rem), glide);
+      this.pos.x = clamp(this.pos.x, -CFG.WORLD, CFG.WORLD);
+      this.pos.z = clamp(this.pos.z, -CFG.WORLD, CFG.WORLD);
     }
   }
 
@@ -2938,6 +3435,7 @@ class Monster {
         this.state = b.s; this.alert = b.a; this.vel.set(b.v[0], 0, b.v[1]);
         this.windup = (b.w || 0) * CFG.MON_WINDUP;
         this.lungeT = b.lg ? 1 : 0;
+        this.grab = (b.gr || 0) * CFG.WATCHER_WINDUP;
         if ((b.ro || 0) > this.roar) this.roar = b.ro;
         if (b.pu) this.punch = 1;
         while (buf.length > 20) buf.shift();
@@ -2952,14 +3450,17 @@ class Monster {
     const sp = Math.hypot(this.vel.x, this.vel.z);
 
     /* animation LOD: far monsters tick on a coarser cadence. CPU only — they
-       still draw every frame, so nothing pops. */
-    const stride = d < 26 ? 1 : d < 52 ? 2 : 4;
+       still draw every frame, so nothing pops. The Watcher is exempt while it
+       has a grab on someone, because that pose is the tell. */
+    const grabbing = this.type === 'watcher' && this.grab > 0.01;
+    const stride = (grabbing || d < 26) ? 1 : d < 52 ? 2 : 4;
     this.skip = (this.skip + 1) % stride;
     if (this.skip === 0 && R) {
       const ctx = {
         speed: sp, chase: this.state === 'chase', alert: clamp(this.alert, 0, 1),
         windup: clamp(Math.max(0, this.windup) / CFG.MON_WINDUP, 0, 1),
         lunge: this.lungeT > 0 ? 1 : 0, roar: clamp(this.roar, 0, 1), dist: d,
+        grab: clamp(this.grab / CFG.WATCHER_WINDUP, 0, 1),
         observed: this.type === 'watcher' ? watcherObserved(this) : false
       };
       this.footFall = 0;
@@ -2982,7 +3483,8 @@ class Monster {
         }
       }
     }
-    const lvl = clamp(this.alert * 0.55 + (this.state === 'chase' ? 0.4 : 0), 0, 0.95);
+    const lvl = clamp(this.alert * 0.55 + (this.state === 'chase' ? 0.4 : 0) +
+                      (this.type === 'watcher' ? clamp(this.grab / CFG.WATCHER_WINDUP, 0, 1) * 0.6 : 0), 0, 0.95);
     AUD.voiceSet(this.id, this.pos, d < 40 ? lvl : 0, this.state === 'chase' ? 1.25 : 0.85);
   }
   netState() {
@@ -2991,6 +3493,7 @@ class Monster {
       s: this.state, a: r2(this.alert), v: [r2(this.vel.x), r2(this.vel.z)],
       w: r2(clamp(Math.max(0, this.windup) / CFG.MON_WINDUP, 0, 1)),
       lg: this.lungeT > 0 ? 1 : 0, ro: r2(clamp(this.roar, 0, 1)),
+      gr: r2(clamp(this.grab / CFG.WATCHER_WINDUP, 0, 1)),
       pu: this.punch > 0.9 ? 1 : 0
     };
   }
@@ -3020,6 +3523,23 @@ function huntTargets() {
     out.push({ id, pos: p, quat: r.av.head.quaternion.clone(), noise: r.noise || 0, downed: r.downed, flash: r.flash, local: false });
   }
   return out;
+}
+/* local read of watcher pressure — drives the HUD warning and the haptics */
+const WATCH = { grab: 0, near: 1e9, seen: false };
+function updateWatcherPressure(dt) {
+  let g = 0, n = 1e9, seen = false;
+  for (const m of MONS) {
+    if (m.type !== 'watcher') continue;
+    const d = m.pos.distanceTo(ME.head);
+    if (d < n) { n = d; seen = watcherObserved(m); }
+    if (d < CFG.WATCHER_ATTACK + 0.5) g = Math.max(g, clamp(m.grab / CFG.WATCHER_WINDUP, 0, 1));
+  }
+  WATCH.grab = g; WATCH.near = n; WATCH.seen = seen;
+  if (g > 0.04 && ME.role === ROLE.SURVIVOR && !ME.downed && !ME.escaped) {
+    ME.hit = Math.max(ME.hit, g * 0.45);
+    if (Math.random() < dt * (2 + g * 10)) hapticBoth(clamp(g, 0.2, 1) * 0.8, 60);
+    if (g > 0.5 && Math.random() < dt * 0.8) AUD.static_(0.09);
+  }
 }
 
 /* ────────── 15. TERMINAL (the in-world computer you type on) ────────── */
@@ -3350,6 +3870,7 @@ const GAME = {
       kinds.push('watcher');
       for (const k of kinds) spawnMonsterFar(k);
       logLine(kinds.length + ' HOLLOWED ARE HUNTING', true);
+      logLine('ONE OF THEM ONLY MOVES WHEN YOU BLINK. KEEP IT IN FRONT OF YOU.', true);
     }
   },
   hostDown(id, from, byId) {
@@ -3463,7 +3984,11 @@ function onPowered() {
   setTimeout(() => AUD.gate(), 600);
   GAME.blackout = 3.0;                 // the one dark moment in the whole game
   // everything that hunts now knows exactly where you are going
-  for (const m of MONS) { m.alert = 1; m.lungeCd = 0; if (m.state !== 'chase') { m.state = 'search'; m.stateT = 0; } }
+  for (const m of MONS) {
+    m.alert = 1; m.lungeCd = 0;
+    if (m.type === 'watcher') m.blinkCd = 0;   // three seconds of blindness is three free steps
+    else if (m.state !== 'chase') { m.state = 'search'; m.stateT = 0; }
+  }
 }
 
 /* ---- damage / down / revive / turning ---- */
@@ -3831,7 +4356,7 @@ const NET = {
           let m = MONS.find(x => x.id === ms.i);
           if (!m) m = spawnMonster(ms.ty, V(ms.p[0], ms.p[1], ms.p[2]), ms.i);
           m.buf.push({ t, p: V(ms.p[0], ms.p[1], ms.p[2]), y: ms.y, s: ms.s, a: ms.a, v: ms.v,
-                       w: ms.w, lg: ms.lg, ro: ms.ro, pu: ms.pu });
+                       w: ms.w, lg: ms.lg, ro: ms.ro, gr: ms.gr, pu: ms.pu });
         }
         for (let i = MONS.length - 1; i >= 0; i--) if (!seen.has(MONS[i].id)) { MONS[i].dispose(); MONS.splice(i, 1); }
         if (d.w) {
@@ -3908,6 +4433,7 @@ const NET = {
         AUD.growl(_v1.set(d.p[0], d.p[1] + 1.5, d.p[2]), d.s || 1);
         if (d.m) { const mm = MONS.find(x => x.id === d.m); if (mm) mm.roar = 1.25; }
         break;
+      case 'wpunch': { const mm = MONS.find(x => x.id === d.m); if (mm) mm.punch = 1; break; }
       case 'pick': { const f = FUSES[d.id]; if (f) { f.state = 'held'; f.holder = d.by; if (d.by !== this.myId && ME.carrying === f) ME.carrying = null; } break; }
       case 'drop': { const f = FUSES[d.id]; if (f) { f.state = 'ground'; f.holder = null; f.pos.set(d.p[0], d.p[1], d.p[2]); if (ME.carrying === f) ME.carrying = null; } break; }
       case 'dep': {
@@ -4082,15 +4608,15 @@ function updateFear(dt) {
     if (d < 18) chasing = true;
   }
   const prox = clamp(1 - (nearest - 3) / 26, 0, 1);
-  GAME.threat = lerp(GAME.threat, (chasing ? 0.62 : 0) + prox * 0.6, 1 - Math.exp(-2.5 * dt));
+  GAME.threat = lerp(GAME.threat, (chasing ? 0.62 : 0) + prox * 0.6 + WATCH.grab * 0.5, 1 - Math.exp(-2.5 * dt));
   AUD.threat(GAME.phase === 'hunt' && ME.role === ROLE.SURVIVOR ? GAME.threat : 0);
 
   // darkness no longer drives dread — proximity does
   let target = 0.03;
   if (GAME.phase === 'hunt' && ME.role === ROLE.SURVIVOR && !ME.escaped) {
-    target = clamp(prox * 0.74 + (chasing ? 0.34 : 0), 0, 1);
+    target = clamp(prox * 0.74 + (chasing ? 0.34 : 0) + WATCH.grab * 0.8, 0, 1);
     if (ME.downed) target = 1;
-    if (GAME.blackout > 0) target = Math.max(target, 0.62);   // the one dark moment
+    if (GAME.blackout > 0) target = Math.max(target, 0.62);   //the one dark moment
   } else if (ME.role === ROLE.HOLLOW) target = 0.1;
   ME.fear = lerp(ME.fear, target, 1 - Math.exp(-1.7 * dt));
 
@@ -4112,6 +4638,8 @@ function objectiveText() {
   if (GAME.phase === 'lobby') return 'WALK TO THE TERMINAL · TYPE A ROOM CODE · HOST OR JOIN';
   if (GAME.phase === 'countdown') return 'BRACE';
   if (GAME.phase === 'over') return '';
+  if (WATCH.grab > 0.04 && ME.role === ROLE.SURVIVOR && !ME.downed)
+    return WATCH.seen ? 'HOLD ITS GAZE' : 'LOOK AT IT — NOW';
   if (ME.role === ROLE.HOLLOW) return 'HUNT THEM';
   if (ME.escaped) return 'YOU ARE OUT — WATCHING';
   if (ME.downed) return 'BLEEDING OUT — SOMEONE LIFT ME';
@@ -4130,6 +4658,8 @@ function updateHUD() {
     `<br>HP <span class="bar"><i style="width:${HP.v}%;background:${HP.v > 40 ? '#4fd6a5' : '#d65f5f'}"></i></span>` +
     `<br>LAMP <span class="bar"><i style="width:${ME.battery | 0}%;background:#e0c56a"></i></span> ${ME.flashOn ? 'ON (THEY HEAR IT)' : 'OFF'}` +
     (ME.carrying ? `<br><span style="color:#ffb35a">CARRYING FUSE</span>` : '') +
+    (WATCH.grab > 0.04
+      ? `<br><span class="warn">GRASP <span class="bar"><i style="width:${(WATCH.grab * 100) | 0}%;background:#8fd8ff"></i></span> ${WATCH.seen ? 'BREAKING' : 'CLOSING'}</span>` : '') +
     (ME.downed ? `<br><span class="warn">DOWNED ${Math.max(0, ME.bleed).toFixed(0)}s</span>` : '') +
     (ME.role === ROLE.HOLLOW ? `<br><span class="warn">YOU ARE HOLLOWED${ME.dashCd > 0 ? ' (DASH ' + ME.dashCd.toFixed(1) + 's)' : ' · Q DASH'}</span>` : '');
   const tl = Math.max(0, GAME.timeLeft) | 0;
@@ -4184,7 +4714,16 @@ function drawWrist() {
     c.fillText(NET.connected ? 'ROOM ' + NET.room : 'OFFLINE', 14, 164);
     c.fillText('CREW ' + (1 + REMOTES.size) + '/' + CFG.MAX_PLAYERS, 14, 186);
   }
-  if (ME.downed) {
+  /* the Watcher's grasp gets the loudest strip on the panel, because it is the
+     one threat you beat by turning your head rather than by running */
+  if (WATCH.grab > 0.04 && !ME.downed) {
+    c.fillStyle = WATCH.seen ? '#8fd8ff' : '#ff5555';
+    c.font = 'bold 17px monospace';
+    c.fillText(WATCH.seen ? 'GRASP BREAKING' : 'LOOK AT IT', 14, 234);
+    c.fillStyle = '#0d2a18'; c.fillRect(14, 240, bw, 8);
+    c.fillStyle = WATCH.seen ? '#8fd8ff' : '#ff5555';
+    c.fillRect(14, 240, bw * WATCH.grab, 8);
+  } else if (ME.downed) {
     c.fillStyle = '#ff5555'; c.font = 'bold 17px monospace';
     c.fillText('BLEEDING OUT ' + Math.max(0, ME.bleed).toFixed(0) + 's', 14, 234);
     c.fillStyle = '#0d2a18'; c.fillRect(14, 240, bw, 8);
@@ -4324,6 +4863,7 @@ function frame() {
       for (const m of MONS) m.simulate(dt, targets);
     }
     for (const m of MONS) m.render(dt, renderT, NET.isHost || !NET.connected);
+    updateWatcherPressure(dt);
 
     updateRemotes(dt, renderT);
     updateFuses(dt, pts);
@@ -4336,6 +4876,7 @@ function frame() {
     updateLamps(dt, ME.head, GAME.blackout > 0);
     GAME.update(dt);
     updateFear(dt);
+    tickShaders(dt);
 
     NET.tick(t);
     NET.updateVoicePositions();
